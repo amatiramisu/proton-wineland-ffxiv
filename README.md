@@ -8,9 +8,9 @@ Releases are built for x86-64-v3 CPUs (AVX2). Extract the archive into `~/.local
 
 ## Use
 
-Set FFXIV to Borderless Windowed. In FFXIV DLSS Forge, choose a higher desktop resolution. Wine exposes the larger desktop to the game and reduces its output to the monitor's native resolution.
+Set FFXIV to Borderless Windowed and choose the desktop resolution in [FFXIV DLSS Forge](https://github.com/amatiramisu/ffxiv-dlss-forge). Wine reduces the larger desktop to the monitor's native resolution.
 
-The modes follow NVIDIA's DSR factors up to 4.00×: 1.20×, 1.50×, 1.78×, 2.00×, 2.25×, 3.00× and 4.00×, with the same resolutions as on Windows. On a 1920×1080 monitor, 1.78× gives 2560×1440 and 4× gives 3840×2160. Set `WINE_DSR_FACTORS` in the game's launch environment to list other factors up to 4, for example `WINE_DSR_FACTORS="2.25, 4"`, or to `0` to disable the extra modes.
+The modes are NVIDIA's DSR factors from 1.20× to 4.00×. `WINE_DSR_FACTORS` in the launch environment selects other factors up to 4, or `0` for none.
 
 ## Changes
 
