@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: amatiramisu <261696294+amatiramisu@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 23:53:30 +0100
+Subject: [PATCH 4/4] winewayland.drv: Use KDE's output order for the primary
+ monitor.
+
+Take the primary monitor from KWin's kde_output_order_v1 when
+WAYLANDDRV_PRIMARY_MONITOR is unset.
+---
+ dlls/winewayland.drv/Makefile.in             |  1 +
+ dlls/winewayland.drv/display.c               | 15 +++++++-
+ dlls/winewayland.drv/kde-output-order-v1.xml | 38 +++++++++++++++++++
+ dlls/winewayland.drv/wayland.c               | 40 ++++++++++++++++++++
+ dlls/winewayland.drv/waylanddrv.h            | 10 ++++-
+ 5 files changed, 101 insertions(+), 3 deletions(-)
+ create mode 100644 dlls/winewayland.drv/kde-output-order-v1.xml
+
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index c1778c3169b..caa7c7a9b8a 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -15,6 +15,7 @@ SOURCES = \
+ 	ext-data-control-v1.xml \
+ 	fractional-scale-v1.xml \
+ 	generic_output_device.c \
++	kde-output-order-v1.xml \
+ 	linux-dmabuf-unstable-v1.xml \
+ 	linux-drm-syncobj-v1.xml \
+ 	keyboard-shortcuts-inhibit-unstable-v1.xml \
+diff --git a/dlls/winewayland.drv/display.c b/dlls/winewayland.drv/display.c
+index 41632d06e16..69f38062d24 100644
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -172,8 +172,9 @@ static void output_info_array_select_primary(struct wl_array *output_info_array)
+     struct output_info *info, *primary = NULL;
+     int count = 0;
+ 
+-    /* Wayland has no primary-output state. Use an explicit override or the
+-     * output at the compositor's logical origin. */
++    /* Core Wayland has no primary-output state. Use an explicit override, the
++     * first output of KDE's output order or the output at the compositor's
++     * logical origin. */
+     if (env && *env)
+     {
+         wl_array_for_each(info, output_info_array)
+@@ -196,6 +197,16 @@ static void output_info_array_select_primary(struct wl_array *output_info_array)
+             ERR("Could not find output %s\n", debugstr_a(env));
+     }
+ 
++    if (process_wayland.output_order_primary)
++    {
++        wl_array_for_each(info, output_info_array)
++        {
++            if (strcmp(info->output->name, process_wayland.output_order_primary)) continue;
++            info->is_primary = TRUE;
++            return;
++        }
++    }
++
+     wl_array_for_each(info, output_info_array)
+     {
+         if (info->output->logical_x || info->output->logical_y) continue;
+diff --git a/dlls/winewayland.drv/kde-output-order-v1.xml b/dlls/winewayland.drv/kde-output-order-v1.xml
+new file mode 100644
+index 00000000000..c6fc7d28f0f
+--- /dev/null
++++ b/dlls/winewayland.drv/kde-output-order-v1.xml
+@@ -0,0 +1,38 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="kde_output_order_v1">
++  <copyright><![CDATA[
++    SPDX-FileCopyrightText: 2022 Xaver Hugl <xaver.hugl@gmail.com>
++
++    SPDX-License-Identifier: MIT-CMU
++    ]]></copyright>
++
++  <interface name="kde_output_order_v1" version="1">
++    <description summary="announce order of outputs">
++        Announce the order in which desktop environment components should be placed on outputs.
++        The compositor will send the list of outputs when the global is bound and whenever there is a change.
++
++        Warning! The protocol described in this file is a desktop environment
++        implementation detail. Regular clients must not use this protocol.
++        Backward incompatible changes may be added without bumping the major
++        version of the extension.
++    </description>
++
++    <event name="output">
++      <description summary="output name">
++        Specifies the output identified by their wl_output.name.
++      </description>
++      <arg name="output_name" type="string" summary="the name of the output"/>
++    </event>
++
++    <event name="done">
++      <description summary="done">
++        Specifies that the output list is complete. On the next output event, a new list begins.
++      </description>
++    </event>
++
++    <request name="destroy" type="destructor">
++      <description summary="Destroy the output order notifier."/>
++    </request>
++  </interface>
++
++</protocol>
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 7b8523e064e..2fec9cb2123 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -615,6 +615,39 @@ BOOL wayland_dmabuf_get_main_device_pci_id(struct pci_id *pci_id)
+ #endif
+ }
+ 
++/**********************************************************************
++ *          KDE output order handling
++ */
++
++static void kde_output_order_v1_handle_output(void *data, struct kde_output_order_v1 *order,
++                                              const char *output_name)
++{
++    /* Only the first output of each list is needed: Plasma's primary. */
++    if (process_wayland.output_order_listing) return;
++    process_wayland.output_order_listing = TRUE;
++    free(process_wayland.output_order_pending);
++    process_wayland.output_order_pending = strdup(output_name);
++}
++
++static void kde_output_order_v1_handle_done(void *data, struct kde_output_order_v1 *order)
++{
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    free(process_wayland.output_order_primary);
++    process_wayland.output_order_primary = process_wayland.output_order_pending;
++    process_wayland.output_order_pending = NULL;
++    process_wayland.output_order_listing = FALSE;
++    TRACE("primary=%s\n", debugstr_a(process_wayland.output_order_primary));
++    /* The outputs can be done before the order arrives. */
++    output_info_array_update();
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++}
++
++static const struct kde_output_order_v1_listener kde_output_order_v1_listener =
++{
++    kde_output_order_v1_handle_output,
++    kde_output_order_v1_handle_done,
++};
++
+ /**********************************************************************
+  *          Registry handling
+  */
+@@ -818,6 +851,13 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+             wl_registry_bind(registry, id, &zwlr_layer_shell_v1_interface,
+                              version < 4 ? version : 4);
+     }
++    else if (strcmp(interface, "kde_output_order_v1") == 0)
++    {
++        process_wayland.kde_output_order_v1 =
++            wl_registry_bind(registry, id, &kde_output_order_v1_interface, 1);
++        kde_output_order_v1_add_listener(process_wayland.kde_output_order_v1,
++                                         &kde_output_order_v1_listener, NULL);
++    }
+     else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0)
+     {
+         process_wayland.zwp_linux_dmabuf_v1 =
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index b0c35084dad..46afba89e5f 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -59,6 +59,7 @@ struct xkb_compose_table;
+ #include "xdg-activation-v1-client-protocol.h"
+ #include "keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h"
+ #include "wlr-layer-shell-unstable-v1-client-protocol.h"
++#include "kde-output-order-v1-client-protocol.h"
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -368,6 +369,7 @@ struct wayland
+     struct xdg_activation_v1 *xdg_activation_v1;
+     struct zwp_keyboard_shortcuts_inhibit_manager_v1* zwp_keyboard_shortcuts_inhibit_manager_v1;
+     struct zwlr_layer_shell_v1 *zwlr_layer_shell_v1;
++    struct kde_output_order_v1 *kde_output_order_v1;
+     struct wayland_seat seat;
+     struct wayland_keyboard keyboard;
+     struct wayland_pointer pointer;
+@@ -377,7 +379,13 @@ struct wayland
+     struct wl_list output_list;
+     struct wl_array output_info_array;
+     BOOL output_layout_accepted;
+-    /* Protects the output_list, output_info_array, and the wayland_output.current states. */
++    /* First output of the compositor's last complete output order (KDE), and of the list
++     * being received. */
++    char *output_order_primary;
++    char *output_order_pending;
++    BOOL output_order_listing;
++    /* Protects the output_list, output_info_array, output_order_primary, and the
++     * wayland_output.current states. */
+     pthread_mutex_t output_mutex;
+     LONG input_serial;
+     pthread_mutex_t activation_mutex;

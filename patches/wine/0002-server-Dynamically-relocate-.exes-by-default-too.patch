@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jade Macho <ade@0x0a.de>
+Date: Wed, 18 Mar 2026 02:06:16 +0100
+Subject: [PATCH 2/4] server: Dynamically relocate .exes by default too
+
+TODO: Should this only be enabled for Vista onwards? Toggleable?
+---
+ dlls/ntdll/unix/virtual.c | 1 -
+ server/mapping.c          | 4 +---
+ 2 files changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index cb96d75f4d3..e45e4ec059f 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3666,7 +3666,6 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
+     }
+ 
+     if (!image_info->map_addr &&
+-        (image_info->image_charact & IMAGE_FILE_DLL) &&
+         (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated))
+     {
+         SERVER_START_REQ( get_image_map_address )
+diff --git a/server/mapping.c b/server/mapping.c
+index e38acf456b8..7506f7e62f8 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -973,7 +973,7 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
+     if (mapping->image.alignment & page_mask)
+         mapping->image.image_flags |= IMAGE_FLAGS_ImageMappedFlat;
+     else if ((mapping->image.dll_charact & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) &&
+-             (has_relocs || mapping->image.contains_code) && !(clr_va && clr_size))
++             has_relocs && !(clr_va && clr_size))
+         mapping->image.image_flags |= IMAGE_FLAGS_ImageDynamicallyRelocated;
+ 
+     align_mask = max( mapping->image.alignment - 1, page_mask );
+@@ -1310,8 +1310,6 @@ static client_ptr_t assign_map_address( struct mapping *mapping )
+     struct addr_range *range = (mapping->image.base >> 32) ? &ranges64 : &ranges32;
+     mem_size_t size = round_size( mapping->size, granularity_mask );
+ 
+-    if (!(mapping->image.image_charact & IMAGE_FILE_DLL)) return 0;
+-
+     if ((ret = get_fd_map_address( mapping->fd ))) return ret;
+ 
+     size += granularity_mask + 1;  /* leave some free space between mappings */

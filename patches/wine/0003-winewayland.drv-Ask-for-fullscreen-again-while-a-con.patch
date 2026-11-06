@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: amatiramisu <261696294+amatiramisu@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 05:59:25 +0100
+Subject: [PATCH 3/4] winewayland.drv: Ask for fullscreen again while a
+ configure waits.
+
+A DSR mode change can leave a borderless window maximized with a
+configure that is never acknowledged, so the game stays black. Request
+fullscreen again in that case.
+---
+ dlls/winewayland.drv/window.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index bbff6be2c7d..c263015c5cb 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1071,6 +1071,23 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
+     /* set_minimized is a one-shot request. */
+     if (!window->minimized) surface->comitted.minimized = FALSE;
+ 
++    /* A configure the window has already taken stays authoritative only while
++     * the window agrees with it. A maximized window that covers its monitor
++     * after the compositor's resize (a desktop mode change left it briefly
++     * smaller) is fullscreen for Win32, so that configure can never be
++     * acknowledged and the surface stops presenting. Ask for fullscreen. */
++    if (processing_config && surface->processing.processed &&
++        (window->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
++        !(surface->processing.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++    {
++        TRACE("hwnd=%p fullscreen again during configure state=%#x\n",
++              surface->hwnd, surface->processing.state);
++        if ((surface->processing.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
++            !surface->fullscreen_requested)
++            xdg_toplevel_unset_maximized(surface->xdg_toplevel);
++        processing_config = FALSE;
++    }
++
+     /* If we are not processing a compositor configure, use the latest Win32
+      * window state to update the Wayland state. */
+     if (!processing_config)
