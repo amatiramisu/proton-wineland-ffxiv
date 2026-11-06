@@ -47,6 +47,10 @@ class PrimaryMonitorTests(unittest.TestCase):
         self.run = self.run_patch.start()
         self.run.return_value = SimpleNamespace(stdout=json.dumps(self.state))
         self.addCleanup(self.run_patch.stop)
+        # The session bus query reads the real desktop; the command route is tested unless a test sets it
+        self.bus_patch = mock.patch.object(desktop_monitor, "_gnome_session_bus", return_value=None)
+        self.bus = self.bus_patch.start()
+        self.addCleanup(self.bus_patch.stop)
         self.log = mock.Mock()
 
     def detect(self):
@@ -64,6 +68,25 @@ class PrimaryMonitorTests(unittest.TestCase):
         self.assertEqual(command[-1], "GetResources")
         self.assertEqual(self.run.call_args.kwargs["timeout"], 2)
         self.log.assert_called_once_with("Using GNOME primary monitor DP-3")
+
+    def test_gnome_session_bus_answers_without_command(self):
+        self.bus.return_value = ["DP-1"]
+        self.assertEqual(self.detect(), "DP-1")
+        self.run.assert_not_called()
+
+    def test_gnome_session_bus_ambiguous_keeps_fallback(self):
+        self.bus.return_value = ["DP-1", "DP-2"]
+        self.assertIsNone(self.detect())
+        self.run.assert_not_called()
+
+    def test_gnome_session_bus_without_primary_uses_command(self):
+        for answer in (None, []):
+            with self.subTest(answer=answer):
+                self.env.pop("WAYLANDDRV_PRIMARY_MONITOR", None)
+                self.run.reset_mock()
+                self.bus.return_value = answer
+                self.assertEqual(self.detect(), "DP-3")
+                self.run.assert_called_once()
 
     def test_gnome_changed_primary_independent_of_output_order(self):
         # After switching to DP-2, GetCurrentState can still mark both logical

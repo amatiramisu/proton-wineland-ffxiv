@@ -1,5 +1,6 @@
 """Resolve a desktop's monitor preference for Wine at launch."""
 
+import ctypes
 import json
 import shlex
 import shutil
@@ -32,6 +33,72 @@ def _gnome_monitors(text):
             return []
         if output[2] >= 0 and primary.get("type") == "b" and primary.get("data") is True:
             monitors.append(output[4])
+    return monitors
+
+
+def _gnome_session_bus():
+    """Mutter's primary output, asked over the session bus through GIO.
+
+    The session bus reaches Mutter from inside the Steam Runtime container too,
+    so this works for launchers without Steam (umu). Returns None when GIO, the
+    bus or Mutter is unavailable.
+    """
+    try:
+        gio = ctypes.CDLL("libgio-2.0.so.0")
+        glib = ctypes.CDLL("libglib-2.0.so.0")
+        gobject = ctypes.CDLL("libgobject-2.0.so.0")
+    except OSError:
+        return None
+    ptr = ctypes.c_void_p
+    gio.g_bus_get_sync.restype = ptr
+    gio.g_bus_get_sync.argtypes = [ctypes.c_int, ptr, ptr]
+    gio.g_dbus_connection_call_sync.restype = ptr
+    gio.g_dbus_connection_call_sync.argtypes = [
+        ptr, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ptr, ptr, ctypes.c_int, ctypes.c_int, ptr, ptr]
+    glib.g_variant_n_children.restype = ctypes.c_size_t
+    glib.g_variant_n_children.argtypes = [ptr]
+    glib.g_variant_get_child_value.restype = ptr
+    glib.g_variant_get_child_value.argtypes = [ptr, ctypes.c_size_t]
+    glib.g_variant_get_int32.restype = ctypes.c_int32
+    glib.g_variant_get_int32.argtypes = [ptr]
+    glib.g_variant_get_string.restype = ctypes.c_char_p
+    glib.g_variant_get_string.argtypes = [ptr, ptr]
+    glib.g_variant_lookup_value.restype = ptr
+    glib.g_variant_lookup_value.argtypes = [ptr, ctypes.c_char_p, ctypes.c_char_p]
+    glib.g_variant_get_boolean.restype = ctypes.c_int
+    glib.g_variant_get_boolean.argtypes = [ptr]
+    glib.g_variant_unref.argtypes = [ptr]
+    gobject.g_object_unref.argtypes = [ptr]
+
+    bus = gio.g_bus_get_sync(2, None, None)  # G_BUS_TYPE_SESSION
+    if not bus:
+        return None
+    # G_DBUS_CALL_FLAGS_NO_AUTO_START, two seconds as for the command route
+    reply = gio.g_dbus_connection_call_sync(
+        bus, b"org.gnome.Mutter.DisplayConfig", b"/org/gnome/Mutter/DisplayConfig",
+        b"org.gnome.Mutter.DisplayConfig", b"GetResources", None, None, 1, 2000, None, None)
+    gobject.g_object_unref(bus)
+    if not reply:
+        return None
+
+    # Same fields as _gnome_monitors: current CRTC (2), name (4), properties (7)
+    monitors = []
+    outputs = glib.g_variant_get_child_value(reply, 2)
+    for i in range(glib.g_variant_n_children(outputs)):
+        output = glib.g_variant_get_child_value(outputs, i)
+        crtc = glib.g_variant_get_child_value(output, 2)
+        name = glib.g_variant_get_child_value(output, 4)
+        props = glib.g_variant_get_child_value(output, 7)
+        primary = glib.g_variant_lookup_value(props, b"primary", b"b")
+        if glib.g_variant_get_int32(crtc) >= 0 and primary and glib.g_variant_get_boolean(primary):
+            monitors.append(glib.g_variant_get_string(name, None).decode())
+        if primary:
+            glib.g_variant_unref(primary)
+        for value in (props, name, crtc, output):
+            glib.g_variant_unref(value)
+    glib.g_variant_unref(outputs)
+    glib.g_variant_unref(reply)
     return monitors
 
 
@@ -110,6 +177,14 @@ def setup_primary_monitor(env, log):
             break
     else:
         return
+
+    if desktop == "GNOME":
+        monitors = _gnome_session_bus()
+        if monitors:
+            if len(monitors) == 1 and monitors[0]:
+                env["WAYLANDDRV_PRIMARY_MONITOR"] = monitors[0]
+                log("Using " + description + " monitor " + monitors[0])
+            return
 
     launcher = shutil.which("steam-runtime-launch-client", path=env.get("PATH"))
     if launcher:
