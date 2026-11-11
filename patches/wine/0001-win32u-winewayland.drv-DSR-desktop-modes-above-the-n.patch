@@ -11,15 +11,22 @@ filter, a Gaussian in linear light with WINE_DSR_SMOOTHNESS. An asset
 directory in WINE_DLDSR_PATH enables NVIDIA's native DL-DSR kernels
 for 1.78x and 2.25x SDR downscaling through NVX binary import, with DSR
 as the setup fallback. Monitor lookups preserve windows below 96 DPI.
+
+A process-local control interface selects the filter and smoothness during
+play. Setting changes retire the Vulkan swapchain through its normal
+rebuild path. Physical mode queries use Wine display data on every desktop.
 ---
- dlls/win32u/sysparams.c                | 147 +++-
- dlls/win32u/vulkan.c                   | 920 +++++++++++++++++++++++++-
- include/wine/vulkan_driver.h           |   3 +
- dlls/winewayland.drv/wayland_pointer.c |   8 +
- 4 files changed, 1058 insertions(+), 20 deletions(-)
+ dlls/win32u/sysparams.c | 160
+ dlls/win32u/vulkan.c | 1115
+ dlls/win32u/win32u_private.h | 1
+ include/wine/vulkan_driver.h | 3
+ include/wine/dsr_control.h | 67
+ include/Makefile.in | 1
+ dlls/winewayland.drv/wayland_pointer.c | 8
+ 7 files changed, 1333 insertions(+), 22 deletions(-)
 
 diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
-index 43d15857c99..1848bd37c35 100644
+index 43d15857c99..e7381542689 100644
 --- a/dlls/win32u/sysparams.c
 +++ b/dlls/win32u/sysparams.c
 @@ -26,6 +26,7 @@
@@ -30,7 +37,15 @@ index 43d15857c99..1848bd37c35 100644
  
  #include "ntstatus.h"
  #define WIN32_NO_STATUS
-@@ -174,6 +175,11 @@ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+@@ -36,6 +37,7 @@
+ #include "d3dkmdt.h"
+ #include "wine/wingdi16.h"
+ #include "wine/server.h"
++#include "wine/dsr_control.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(system);
+ 
+@@ -174,6 +176,11 @@ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
  
  static BOOL emulate_modelist = TRUE;
  static BOOL emulate_modeset = TRUE;
@@ -42,7 +57,7 @@ index 43d15857c99..1848bd37c35 100644
  static UINT limit_resolutions = 0;
  BOOL decorated_mode = TRUE;
  UINT64 thunk_lock_callback = 0;
-@@ -2493,6 +2499,42 @@ static UINT add_virtual_mode( DEVMODEW *modes, UINT count, const DEVMODEW *mode,
+@@ -2493,6 +2500,42 @@ static UINT add_virtual_mode( DEVMODEW *modes, UINT count, const DEVMODEW *mode,
      return 2;
  }
  
@@ -85,7 +100,7 @@ index 43d15857c99..1848bd37c35 100644
  static SIZE *get_screen_sizes( const DEVMODEW *maximum, const DEVMODEW *modes, UINT modes_count,
                                 UINT *sizes_count )
  {
-@@ -2645,7 +2687,7 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
+@@ -2645,7 +2688,7 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
      if (freqs[1] <= 60) freqs[1] = 0;
  
      if (!(screen_sizes = get_screen_sizes( maximum, host_modes, host_modes_count, &sizes_count ))) return NULL;
@@ -94,7 +109,7 @@ index 43d15857c99..1848bd37c35 100644
  
      if ((env = getenv( "SteamAppId" )) && !strcmp( env, "403640" ))
      {
-@@ -2696,6 +2738,16 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
+@@ -2696,6 +2739,16 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
              mode.dmPelsHeight = vertical ? maximum->dmPelsWidth : maximum->dmPelsHeight;
              count += add_virtual_mode( modes, count, &mode, center_modes );
          }
@@ -111,7 +126,7 @@ index 43d15857c99..1848bd37c35 100644
      }
  
      *modes_count = count;
-@@ -3099,7 +3151,21 @@ static RECT monitor_get_rect( struct monitor *monitor, UINT dpi, MONITOR_DPI_TYP
+@@ -3099,7 +3152,21 @@ static RECT monitor_get_rect( struct monitor *monitor, UINT dpi, MONITOR_DPI_TYP
               mode->dmPosition.y + mode->dmPelsHeight );
  
      dpi_from = monitor_get_dpi( monitor, type, &x, &y );
@@ -134,7 +149,7 @@ index 43d15857c99..1848bd37c35 100644
  }
  
  /* display_lock must be held */
-@@ -3517,10 +3583,62 @@ static UINT update_display_devices( struct device_manager_ctx *ctx )
+@@ -3517,10 +3584,62 @@ static UINT update_display_devices( struct device_manager_ctx *ctx )
      return status;
  }
  
@@ -197,7 +212,7 @@ index 43d15857c99..1848bd37c35 100644
      LIST_FOR_EACH_ENTRY_SAFE( gpu, next, &ctx->vulkan_gpus, struct gpu_info, entry )
      {
          TRACE( "adding vulkan-only gpu uuid %s, name %s\n", debugstr_guid(&gpu->uuid), debugstr_a(gpu->name));
-@@ -3740,7 +3858,8 @@ static void release_display_dc( HDC hdc )
+@@ -3740,7 +3859,8 @@ static void release_display_dc( HDC hdc )
  static struct monitor *get_monitor_from_rect( RECT rect, UINT flags, UINT dpi, MONITOR_DPI_TYPE type )
  {
      struct monitor *monitor, *primary = NULL, *nearest = NULL, *found = NULL;
@@ -207,7 +222,7 @@ index 43d15857c99..1848bd37c35 100644
  
      if (IsRectEmpty( &rect ))
      {
-@@ -3751,19 +3870,23 @@ static struct monitor *get_monitor_from_rect( RECT rect, UINT flags, UINT dpi, M
+@@ -3751,19 +3871,23 @@ static struct monitor *get_monitor_from_rect( RECT rect, UINT flags, UINT dpi, M
      LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
      {
          RECT intersect, monitor_rect;
@@ -234,7 +249,21 @@ index 43d15857c99..1848bd37c35 100644
              if (area > max_area)
              {
                  max_area = area;
-@@ -6900,6 +7023,18 @@ void sysparams_init(void)
+@@ -5434,7 +5558,12 @@ BOOL WINAPI NtUserEnumDisplaySettings( UNICODE_STRING *device, DWORD index, DEVM
+ 
+     if (index == ENUM_REGISTRY_SETTINGS) ret = source_get_registry_settings( source, devmode );
+     else if (index == ENUM_CURRENT_SETTINGS) ret = source_get_current_settings( source, devmode );
+-    else if (index == WINE_ENUM_PHYSICAL_SETTINGS) ret = FALSE;
++    else if (index == WINE_ENUM_PHYSICAL_SETTINGS)
++    {
++        memcpy( &devmode->dmFields, &source->physical.dmFields,
++                offsetof(DEVMODEW, dmICMMethod) - offsetof(DEVMODEW, dmFields) );
++        ret = TRUE;
++    }
+     else ret = source_enum_display_settings( source, index, devmode, flags );
+     source_release( source );
+ 
+@@ -6900,6 +7029,18 @@ void sysparams_init(void)
          emulate_modelist = !IS_OPTION_TRUE( buffer[0] );
      if (!get_config_key( hkey, appkey, "EmulateModeset", buffer, sizeof(buffer) ))
          emulate_modeset = IS_OPTION_TRUE( buffer[0] );
@@ -253,8 +282,22 @@ index 43d15857c99..1848bd37c35 100644
  
      {
          const char *decorate = NULL;
+@@ -7033,9 +7174,12 @@ BOOL WINAPI NtUserSystemParametersInfo( UINT action, UINT val, void *ptr, UINT w
+         ret = TRUE; \
+         break
+ 
+-    BOOL ret = user_driver->pSystemParametersInfo( action, val, ptr, winini );
++    BOOL ret;
+     unsigned spi_idx = 0;
+ 
++    if (action == WINE_SPI_DSR_CONTROL) return vulkan_dsr_control( val, ptr );
++    ret = user_driver->pSystemParametersInfo( action, val, ptr, winini );
++
+     if (!ret) switch (action)
+     {
+     case SPI_GETBEEP:
 diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
-index 2c89ae31dbc..d04b2cf7f2c 100644
+index 2c89ae31dbc..76ff77839c5 100644
 --- a/dlls/win32u/vulkan.c
 +++ b/dlls/win32u/vulkan.c
 @@ -27,6 +27,8 @@
@@ -266,7 +309,23 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  #include <dlfcn.h>
  #include <pthread.h>
  #include <time.h>
-@@ -259,6 +261,11 @@ struct fs_hack_upscaler
+@@ -48,6 +50,7 @@
+ #include "win32u_private.h"
+ #include "ntuser_private.h"
+ #include "wine/hwnd_dmabuf.h"
++#include "wine/dsr_control.h"
+ 
+ #include "fshack_color_spv.h"
+ #include "fsr_spv.h"
+@@ -206,6 +209,7 @@ struct surface
+     struct vulkan_surface obj;
+     struct client_surface *client;
+     struct swapchain *swapchain;
++    struct dsr_window_state *dsr;
+     HWND hwnd;
+     pthread_mutex_t host_lock;
+     /* Fullscreen state callbacks use this lock, never host_lock. */
+@@ -259,6 +263,11 @@ struct fs_hack_upscaler
      enum fs_hack_color_mode color_mode;
      BOOL is_blit, is_fsr, is_nis;
      BOOL linear_filter;
@@ -278,7 +337,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      union {
          struct {
          } blit;
-@@ -285,6 +292,65 @@ static BOOL fs_hack_is_integer(void)
+@@ -285,6 +294,182 @@ static BOOL fs_hack_is_integer(void)
      return is_int;
  }
  
@@ -296,6 +355,123 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
 +        TRACE( "dsr_smoothness: %.2f\n", smoothness );
 +    }
 +    return smoothness;
++}
++
++struct dsr_window_state
++{
++    struct list entry;
++    UINT refs;
++    struct wine_dsr_control control;
++};
++
++static pthread_mutex_t dsr_control_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct list dsr_windows = LIST_INIT(dsr_windows);
++
++static struct wine_dsr_control dsr_defaults( HWND hwnd )
++{
++    struct wine_dsr_control control = {0};
++
++    control.hwnd = (ULONG_PTR)hwnd;
++    control.size = sizeof(control);
++    control.version = WINE_DSR_CONTROL_VERSION;
++    control.method = WINE_DSR_AUTO;
++    control.smoothness = lroundf( fs_hack_dsr_smoothness() * 100.0f );
++    control.capabilities = WINE_DSR_CAP_CONTROL | WINE_DSR_CAP_GAUSSIAN;
++    control.active_method = WINE_DSR_OFF;
++    control.reason = WINE_DSR_WAITING;
++    control.generation = 1;
++    return control;
++}
++
++static struct dsr_window_state *dsr_window_acquire( HWND hwnd )
++{
++    struct dsr_window_state *state;
++
++    pthread_mutex_lock( &dsr_control_lock );
++    LIST_FOR_EACH_ENTRY( state, &dsr_windows, struct dsr_window_state, entry )
++        if (state->control.hwnd == (ULONG_PTR)hwnd)
++        {
++            state->refs++;
++            pthread_mutex_unlock( &dsr_control_lock );
++            return state;
++        }
++    if ((state = calloc( 1, sizeof(*state) )))
++    {
++        state->refs = 1;
++        state->control = dsr_defaults( hwnd );
++        list_add_tail( &dsr_windows, &state->entry );
++    }
++    pthread_mutex_unlock( &dsr_control_lock );
++    return state;
++}
++
++static void dsr_window_release( struct dsr_window_state *state )
++{
++    if (!state) return;
++    pthread_mutex_lock( &dsr_control_lock );
++    if (!--state->refs)
++    {
++        list_remove( &state->entry );
++        free( state );
++    }
++    pthread_mutex_unlock( &dsr_control_lock );
++}
++
++BOOL vulkan_dsr_control( UINT size, void *ptr )
++{
++    struct wine_dsr_control *control = ptr;
++    struct dsr_window_state *state;
++    HWND hwnd;
++
++    if (!control || size != sizeof(*control) || control->size != size ||
++        control->version != WINE_DSR_CONTROL_VERSION || control->operation > WINE_DSR_SET ||
++        (control->operation == WINE_DSR_SET &&
++         (control->method > WINE_DSR_NEURAL || control->smoothness > 100)))
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    hwnd = (HWND)(ULONG_PTR)control->hwnd;
++    if (HandleToULong( NtUserQueryWindow( hwnd, WindowProcess ) ) != GetCurrentProcessId())
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
++        return FALSE;
++    }
++
++    pthread_mutex_lock( &dsr_control_lock );
++    LIST_FOR_EACH_ENTRY( state, &dsr_windows, struct dsr_window_state, entry )
++        if (state->control.hwnd == control->hwnd)
++        {
++            if (control->operation == WINE_DSR_SET &&
++                (state->control.method != control->method || state->control.smoothness != control->smoothness))
++            {
++                state->control.method = control->method;
++                state->control.smoothness = control->smoothness;
++                state->control.generation++;
++            }
++            *control = state->control;
++            pthread_mutex_unlock( &dsr_control_lock );
++            return TRUE;
++        }
++    if (control->operation == WINE_DSR_QUERY)
++    {
++        *control = dsr_defaults( hwnd );
++        pthread_mutex_unlock( &dsr_control_lock );
++        return TRUE;
++    }
++    pthread_mutex_unlock( &dsr_control_lock );
++    RtlSetLastWin32Error( ERROR_NOT_READY );
++    return FALSE;
++}
++
++static struct wine_dsr_control dsr_snapshot( struct surface *surface )
++{
++    struct wine_dsr_control control;
++
++    pthread_mutex_lock( &dsr_control_lock );
++    control = surface->dsr ? surface->dsr->control : dsr_defaults( surface->hwnd );
++    pthread_mutex_unlock( &dsr_control_lock );
++    return control;
 +}
 +
 +/* The exp2 coefficient of NVIDIA's DSR Gaussian for a scale per axis and a smoothness from 0 to 1
@@ -344,7 +520,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  struct fs_hack_image
  {
      uint32_t cmd_queue_idx;
-@@ -295,8 +361,37 @@ struct fs_hack_image
+@@ -295,8 +480,37 @@ struct fs_hack_image
      VkSemaphore blit_finished;
      VkImageView user_view, swapchain_view, fsr_view;
      VkDescriptorSet descriptor_set, fsr_set;
@@ -382,15 +558,73 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  struct fs_comp_pipeline
  {
      VkPipelineLayout pipeline_layout;
-@@ -487,6 +582,7 @@ struct swapchain
+@@ -487,6 +701,10 @@ struct swapchain
      VkDescriptorSetLayout descriptor_set_layout;
      VkFormat format;
      struct fs_hack_upscaler upscaler;
 +    struct fs_hack_dldsr dldsr;
++    struct wine_dsr_control dsr_config;
++    UINT dsr_reason;
++    VkResult dsr_result;
  
      struct fs_comp_pipeline blit_pipeline;
      struct fs_comp_pipeline fsr_easu_pipeline;
-@@ -1220,6 +1316,8 @@ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_crea
+@@ -499,6 +717,45 @@ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
+     return CONTAINING_RECORD( obj, struct swapchain, obj );
+ }
+ 
++static BOOL dsr_config_changed( struct swapchain *swapchain )
++{
++    BOOL changed;
++
++    pthread_mutex_lock( &dsr_control_lock );
++    changed = swapchain->surface->dsr &&
++              swapchain->surface->dsr->control.generation != swapchain->dsr_config.generation;
++    pthread_mutex_unlock( &dsr_control_lock );
++    return changed;
++}
++
++static void dsr_publish( struct vulkan_device *device, struct swapchain *swapchain, BOOL presented )
++{
++    struct dsr_window_state *state = swapchain->surface->dsr;
++    struct wine_dsr_control *control;
++
++    if (!state) return;
++    pthread_mutex_lock( &dsr_control_lock );
++    control = &state->control;
++    control->capabilities = WINE_DSR_CAP_CONTROL | WINE_DSR_CAP_GAUSSIAN |
++                            (device->dldsr_enabled ? WINE_DSR_CAP_NEURAL : 0);
++    if (presented && swapchain->dsr_config.generation == control->generation)
++    {
++        control->active_method = swapchain->upscaler.is_dldsr ? WINE_DSR_NEURAL :
++                                 swapchain->upscaler.is_dsr ? WINE_DSR_GAUSSIAN : WINE_DSR_OFF;
++        control->active_smoothness = swapchain->dsr_config.smoothness;
++        control->source_width = swapchain->extents.width;
++        control->source_height = swapchain->extents.height;
++        control->target_width = swapchain->fshack.enabled ?
++            (UINT)(swapchain->fshack.dst.right - swapchain->fshack.dst.left) : swapchain->extents.width;
++        control->target_height = swapchain->fshack.enabled ?
++            (UINT)(swapchain->fshack.dst.bottom - swapchain->fshack.dst.top) : swapchain->extents.height;
++        control->reason = swapchain->dsr_reason;
++        control->result = swapchain->dsr_result;
++        control->applied_generation = swapchain->dsr_config.generation;
++    }
++    pthread_mutex_unlock( &dsr_control_lock );
++}
++
+ static BOOL managed_color_space_from_vulkan( VkColorSpaceKHR color_space, unsigned int *wire_color_space )
+ {
+     switch (color_space)
+@@ -562,6 +819,8 @@ static BOOL swapchain_is_out_of_date( struct swapchain *swapchain )
+ {
+     LONG generation;
+ 
++    /* A setting change retires the swapchain. The client owns resource synchronization during its rebuild. */
++    if (dsr_config_changed( swapchain )) return TRUE;
+     generation = ReadAcquire( &swapchain->surface->client->presentation_generation );
+     if (swapchain->presentation_generation != generation || ReadAcquire( &swapchain->cloak_invalidated )) return TRUE;
+ 
+@@ -1220,6 +1479,8 @@ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_crea
      pthread_key_create(&instance->obj.transient_object_handle, free);
  
      if ((res = convert_instance_create_info( &pool, create_info, instance ))) goto failed;
@@ -399,7 +633,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      driver_layer_count = create_info->enabledLayerCount;
      callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext,
                                       VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK );
-@@ -1324,6 +1422,98 @@ static void parse_device_extensions( struct vulkan_device_extensions *extensions
+@@ -1324,6 +1585,98 @@ static void parse_device_extensions( struct vulkan_device_extensions *extensions
      if (next > str) add_device_extension( str, next - str, extensions );
  }
  
@@ -498,7 +732,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  static VkResult convert_device_create_info( struct vulkan_physical_device *physical_device, VkDeviceCreateInfo *info,
                                              struct mempool *pool, struct vulkan_device *device )
  {
-@@ -1411,6 +1601,8 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
+@@ -1411,6 +1764,8 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
          }
      }
  
@@ -507,7 +741,23 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      if (!(extensions = mem_alloc( pool, sizeof(device->extensions) * 8 * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
  #define USE_VK_EXT(x) if (device->extensions.has_ ## x) extensions[count++] = #x;
      ALL_VK_DEVICE_EXTS
-@@ -2983,6 +3175,366 @@ out:
+@@ -2313,6 +2668,7 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
+         free( surface );
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+     }
++    surface->dsr = dsr_window_acquire( surface->hwnd );
+     list_add_tail( &surface->host_surfaces, &surface->active_host->entry );
+     add_window_client_surface( surface->hwnd, surface->client );
+ 
+@@ -2348,6 +2704,7 @@ static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR
+     client_surface_release( surface->client );
+ 
+     instance->p_remove_object( instance, &surface->obj.obj );
++    dsr_window_release( surface->dsr );
+ 
+     pthread_mutex_destroy( &surface->fullscreen_lock );
+     pthread_mutex_destroy( &surface->host_lock );
+@@ -2983,6 +3340,366 @@ out:
      return res;
  }
  
@@ -874,7 +1124,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  static VkResult create_descriptor_set( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
  {
      VkDescriptorImageInfo userDescriptorImageInfo = {0}, realDescriptorImageInfo = {0};
-@@ -3106,6 +3658,213 @@ static BOOL fs_hack_format_supports( struct vulkan_physical_device *physical_dev
+@@ -3106,6 +3823,215 @@ static BOOL fs_hack_format_supports( struct vulkan_physical_device *physical_dev
      return (props.optimalTilingFeatures & features) == features;
  }
  
@@ -1066,7 +1316,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
 +    free( weights );
 +    WARN( "Enabled DL-DSR %s, %ux%u -> %ux%u, smoothness %.0f%%\n", dl->model ? "2.25x" : "1.78x",
 +          swapchain->extents.width, swapchain->extents.height, swapchain->host_extents.width,
-+          swapchain->host_extents.height, fs_hack_dsr_smoothness() * 100.0f );
++          swapchain->host_extents.height, (float)swapchain->dsr_config.smoothness );
 +    return VK_SUCCESS;
 +
 +fail:
@@ -1081,6 +1331,8 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
 +    }
 +    destroy_dldsr_state( device, swapchain );
 +    swapchain->upscaler.is_dldsr = FALSE;
++    swapchain->dsr_reason = WINE_DSR_SETUP;
++    swapchain->dsr_result = res;
 +    WARN( "DL-DSR setup returned %d, using the DSR filter\n", res );
 +    return res;
 +}
@@ -1088,7 +1340,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  static VkResult init_compute_state( struct vulkan_device *device, struct swapchain *swapchain )
  {
      VkResult res;
-@@ -3123,6 +3882,12 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
+@@ -3123,6 +4049,12 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
      uint32_t i;
      uint32_t fsr_memory_type = -1;
  
@@ -1101,7 +1353,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
      samplerInfo.magFilter = samplerInfo.minFilter =
          (swapchain->upscaler.is_fsr ||
-@@ -3137,10 +3902,11 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
+@@ -3137,10 +4069,11 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
      samplerInfo.anisotropyEnable = VK_FALSE;
      samplerInfo.maxAnisotropy = 1;
      samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
@@ -1115,7 +1367,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      samplerInfo.mipLodBias = 0.0f;
      samplerInfo.minLod = 0.0f;
      samplerInfo.maxLod = 0.0f;
-@@ -3197,7 +3963,10 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
+@@ -3197,7 +4130,10 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
          goto fail;
      }
  
@@ -1127,7 +1379,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
          res = create_pipeline( device, swapchain, blit_comp_spv, sizeof(blit_comp_spv),
                                 4 * sizeof(float), &swapchain->blit_pipeline );
      else
-@@ -3396,6 +4165,7 @@ fail:
+@@ -3396,6 +4332,7 @@ fail:
  static void destroy_fs_hack_image( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
  {
      device->p_vkDestroyImageView( device->host.device, hack->user_view, NULL );
@@ -1135,7 +1387,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      device->p_vkDestroyImageView(device->host.device, hack->swapchain_view, NULL);
      device->p_vkDestroyImageView(device->host.device, hack->fsr_view, NULL);
      device->p_vkDestroyImage( device->host.device, hack->user_image, NULL );
-@@ -3430,10 +4200,15 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+@@ -3430,10 +4367,15 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
          return res;
      }
  
@@ -1152,7 +1404,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  
      if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &count, real_images )))
      {
-@@ -3447,6 +4222,9 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+@@ -3447,6 +4389,9 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
          struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
  
          hack->swapchain_image = real_images[i];
@@ -1162,7 +1414,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  
          semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
          if ((res = device->p_vkCreateSemaphore( device->host.device, &semaphoreInfo, NULL, &hack->blit_finished )))
-@@ -3473,7 +4251,7 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+@@ -3473,7 +4418,7 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
  
          if (createinfo->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
              imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
@@ -1171,7 +1423,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
              imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
  
          if ((res = device->p_vkCreateImage( device->host.device, &imageInfo, NULL, &hack->user_image )))
-@@ -3488,8 +4266,6 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+@@ -3488,8 +4433,6 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
          if (offs) userMemTotal += userMemReq.alignment - offs;
  
          userMemTotal += userMemReq.size;
@@ -1180,7 +1432,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      }
  
      /* allocate backing memory */
-@@ -3566,10 +4342,8 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+@@ -3566,10 +4509,8 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
      return VK_SUCCESS;
  
  fail:
@@ -1192,7 +1444,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      return res;
  }
  
-@@ -3710,8 +4484,20 @@ static BOOL surface_get_fshack_config( struct surface *surface, const VkExtent2D
+@@ -3710,8 +4651,20 @@ static BOOL surface_get_fshack_config( struct surface *surface, const VkExtent2D
      return TRUE;
  }
  
@@ -1213,7 +1465,16 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      return surface->client->funcs->is_presentation_scaled &&
             surface->client->funcs->is_presentation_scaled( surface->client );
  }
-@@ -5591,6 +6377,37 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+@@ -5558,6 +6511,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+         goto failed_locked;
+     }
+ 
++    swapchain->dsr_config = dsr_snapshot( surface );
++    swapchain->dsr_reason = WINE_DSR_NATIVE;
+     swapchain->fullscreen_policy = fullscreen_policy;
+     swapchain->fullscreen_owner = fullscreen_owner;
+     swapchain->color_space = create_info->imageColorSpace;
+@@ -5591,6 +6546,57 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
              WARN( "FSR cannot compose an offset fullscreen destination, using the blit scaler\n" );
              swapchain->upscaler.is_fsr = FALSE;
          }
@@ -1223,7 +1484,12 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
 +            const UINT src_w = create_info->imageExtent.width, src_h = create_info->imageExtent.height;
 +
 +            /* A desktop above the monitor (DSR modes) uses NVIDIA's DSR filter */
-+            if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB && dst_w && dst_h &&
++            if (src_w > dst_w && src_h > dst_h)
++                swapchain->dsr_reason = WINE_DSR_FORMAT;
++            if (swapchain->dsr_config.method == WINE_DSR_OFF)
++                swapchain->dsr_reason = WINE_DSR_DISABLED;
++            if (swapchain->dsr_config.method != WINE_DSR_OFF &&
++                swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB && dst_w && dst_h &&
 +                src_w > dst_w && src_h > dst_h)
 +            {
 +                float scale, scale_y;
@@ -1231,27 +1497,50 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
 +                dsr_axis( src_w, dst_w, &scale, &swapchain->upscaler.dsr_ratio[0] );
 +                dsr_axis( src_h, dst_h, &scale_y, &swapchain->upscaler.dsr_ratio[1] );
 +                swapchain->upscaler.is_dsr = TRUE;
-+                swapchain->upscaler.dsr_k = dsr_coefficient( scale, fs_hack_dsr_smoothness() );
++                swapchain->upscaler.dsr_k = dsr_coefficient( scale, swapchain->dsr_config.smoothness / 100.0f );
++                swapchain->dsr_reason = WINE_DSR_READY;
 +                swapchain->upscaler.is_fsr = FALSE;
 +                swapchain->upscaler.linear_filter = TRUE;
 +                TRACE( "Reducing %ux%u to %ux%u with the DSR filter, scale %.4f, coefficient %.8e\n", src_w, src_h,
 +                       dst_w, dst_h, scale, swapchain->upscaler.dsr_k );
 +
 +                source_view_format = srgb_to_unorm( create_info->imageFormat );
-+                if (device->dldsr_enabled && full_host && create_info->imageArrayLayers == 1 &&
-+                    !(create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR) &&
-+                    (source_view_format == VK_FORMAT_R8G8B8A8_UNORM || source_view_format == VK_FORMAT_B8G8R8A8_UNORM) &&
-+                    fs_hack_dldsr_model( create_info->imageExtent, swapchain->host_extents, &swapchain->dldsr.model ))
++                if (swapchain->dsr_config.method == WINE_DSR_NEURAL ||
++                    (swapchain->dsr_config.method == WINE_DSR_AUTO && device->dldsr_enabled))
 +                {
-+                    swapchain->upscaler.is_dldsr = TRUE;
-+                    swapchain->dldsr.source_format = source_view_format;
++                    const char *path = getenv( "WINE_DLDSR_PATH" );
++
++                    if (!path || !*path) swapchain->dsr_reason = WINE_DSR_ASSETS;
++                    else if (!device->dldsr_enabled) swapchain->dsr_reason = WINE_DSR_DEVICE;
++                    else if (!full_host || create_info->imageArrayLayers != 1 ||
++                             (create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR) ||
++                             (source_view_format != VK_FORMAT_R8G8B8A8_UNORM && source_view_format != VK_FORMAT_B8G8R8A8_UNORM))
++                        swapchain->dsr_reason = WINE_DSR_FORMAT;
++                    else if (!fs_hack_dldsr_model( create_info->imageExtent, swapchain->host_extents, &swapchain->dldsr.model ))
++                    {
++                        if (swapchain->dsr_config.method == WINE_DSR_NEURAL)
++                            swapchain->dsr_reason = WINE_DSR_FACTOR;
++                    }
++                    else
++                    {
++                        swapchain->upscaler.is_dldsr = TRUE;
++                        swapchain->dldsr.source_format = source_view_format;
++                    }
 +                }
 +            }
 +        }
          swapchain->upscaler.fsr.lite = lite;
          swapchain->upscaler.fsr.sharpness = sharpness;
          create_info_host.imageExtent = swapchain->host_extents;
-@@ -5860,19 +6677,20 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
+@@ -5815,6 +6821,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+     }
+ 
+     set_window_pixel_format( surface->hwnd, -1, TRUE );
++    dsr_publish( device, swapchain, FALSE );
+ 
+     *ret = swapchain->obj.client.swapchain;
+     return VK_SUCCESS;
+@@ -5860,19 +6867,20 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
  
      if (swapchain->fshack.enabled && !swapchain->managed)
      {
@@ -1274,7 +1563,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
          device->p_vkDestroyDescriptorSetLayout( device->host.device, swapchain->descriptor_set_layout, NULL );
          device->p_vkDestroyDescriptorPool( device->host.device, swapchain->descriptor_pool, NULL );
          device->p_vkDestroySampler( device->host.device, swapchain->sampler, NULL );
-@@ -6586,6 +7404,72 @@ static void init_barrier(VkImageMemoryBarrier *barrier)
+@@ -6586,6 +7594,72 @@ static void init_barrier(VkImageMemoryBarrier *barrier)
      barrier->subresourceRange.layerCount = 1;
  }
  
@@ -1289,7 +1578,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
 +    /* CUDA's packed-parameter-buffer ABI, consumed synchronously while recording. */
 +    const void *extras[] = {(void *)1, &params, (void *)2, &param_size, NULL};
 +    const UINT tile_width = dl->model ? 48 : 32;
-+    float smoothness = fs_hack_dsr_smoothness() * 100.0f;
++    float smoothness = swapchain->dsr_config.smoothness;
 +    VkResult res;
 +
 +    begin_info.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
@@ -1347,7 +1636,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
  static VkResult record_compute_cmd( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
  {
      struct fs_hack_color_constants color_constants;
-@@ -6623,7 +7507,14 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
+@@ -6623,7 +7697,14 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
      device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                      0, 0, NULL, 0, NULL, 2, barriers );
  
@@ -1363,7 +1652,7 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
      {
          constants[0] = swapchain->fshack.dst.left;
          constants[1] = swapchain->fshack.dst.top;
-@@ -7341,7 +8232,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+@@ -7341,7 +8422,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
              replacement.cmd = VK_NULL_HANDLE;
              replacement.cmd_queue_idx = queue_idx;
              if ((res = create_hack_cmd( queue, swapchain, queue_idx, &replacement.cmd )) ||
@@ -1373,6 +1662,30 @@ index 2c89ae31dbc..d04b2cf7f2c 100644
                                                     record_compute_cmd( device, swapchain, &replacement )))
              {
                  if (replacement.cmd)
+@@ -7724,6 +8806,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         }
+     }
+ 
++    for (uint32_t i = 0; i < present_info->swapchainCount; i++)
++        if (present_swapchains[i] && present_results[i] >= VK_SUCCESS &&
++            (internal_work_submitted || present_waits_submitted || present_result_was_enqueued( res )))
++            dsr_publish( device, present_swapchains[i], TRUE );
++
+     if (present_info->pResults)
+         for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+         {
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 43306664143..e539280077c 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -223,6 +223,7 @@ struct gpu_info
+ };
+ 
+ extern BOOL get_vulkan_gpus( struct list *gpus );
++extern BOOL vulkan_dsr_control( UINT size, void *ptr );
+ 
+ extern int d3dkmt_object_get_fd( D3DKMT_HANDLE local );
+ extern NTSTATUS d3dkmt_destroy_mutex( D3DKMT_HANDLE local );
 diff --git a/include/wine/vulkan_driver.h b/include/wine/vulkan_driver.h
 index 9f786b7c995..9f217698299 100644
 --- a/include/wine/vulkan_driver.h
@@ -1394,6 +1707,91 @@ index 9f786b7c995..9f217698299 100644
  };
  
  static inline void vulkan_queue_lock( struct vulkan_queue *queue )
+diff --git a/include/wine/dsr_control.h b/include/wine/dsr_control.h
+new file mode 100644
+index 00000000000..a3fe7670cae
+--- /dev/null
++++ b/include/wine/dsr_control.h
+@@ -0,0 +1,67 @@
++#ifndef WINE_DSR_CONTROL_H
++#define WINE_DSR_CONTROL_H
++
++#include <stdint.h>
++
++/* Private SystemParametersInfoW protocol. Fields use fixed widths. */
++#define WINE_SPI_DSR_CONTROL 0x44535201u
++#define WINE_DSR_CONTROL_VERSION 1u
++#define WINE_DSR_PHYSICAL_MODE ((uint32_t)-3)
++
++enum wine_dsr_method
++{
++    WINE_DSR_AUTO = 0,
++    WINE_DSR_OFF = 1,
++    WINE_DSR_GAUSSIAN = 2,
++    WINE_DSR_NEURAL = 3
++};
++
++enum wine_dsr_operation
++{
++    WINE_DSR_QUERY = 0,
++    WINE_DSR_SET = 1
++};
++
++enum wine_dsr_capability
++{
++    WINE_DSR_CAP_CONTROL = 1,
++    WINE_DSR_CAP_GAUSSIAN = 2,
++    WINE_DSR_CAP_NEURAL = 4
++};
++
++enum wine_dsr_reason
++{
++    WINE_DSR_READY = 0,
++    WINE_DSR_WAITING = 1,
++    WINE_DSR_ASSETS = 2,
++    WINE_DSR_DEVICE = 3,
++    WINE_DSR_FORMAT = 4,
++    WINE_DSR_FACTOR = 5,
++    WINE_DSR_SETUP = 6,
++    WINE_DSR_NATIVE = 7,
++    WINE_DSR_DISABLED = 8,
++    WINE_DSR_PRESENTATION = 9
++};
++
++struct wine_dsr_control
++{
++    uint64_t hwnd;
++    uint32_t size;
++    uint32_t version;
++    uint32_t operation;
++    uint32_t method;
++    uint32_t smoothness;
++    uint32_t capabilities;
++    uint32_t active_method;
++    uint32_t active_smoothness;
++    uint32_t reason;
++    uint32_t source_width;
++    uint32_t source_height;
++    uint32_t target_width;
++    uint32_t target_height;
++    uint32_t generation;
++    uint32_t applied_generation;
++    int32_t result;
++};
++
++#endif
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 9f44d39f527..a00c5d1c0ae 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -966,6 +966,7 @@ SOURCES = \
+ 	wine/condrv.h \
+ 	wine/dcetypes.idl \
+ 	wine/debug.h \
++	wine/dsr_control.h \
+ 	wine/dplaysp.h \
+ 	wine/epm.idl \
+ 	wine/exception.h \
 diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
 index 3c8b0ff38de..70cec47664e 100644
 --- a/dlls/winewayland.drv/wayland_pointer.c
