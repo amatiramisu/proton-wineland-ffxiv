@@ -6,14 +6,17 @@ Subject: [PATCH 1/4] win32u, winewayland.drv: DSR desktop modes above the
 
 Adds desktop modes at area factors of each monitor's native mode
 (NVIDIA's 1.20x to 4.00x by default, set with WINE_DSR_FACTORS). The
-Vulkan swapchain reduces the image to the monitor, averaging pixel
-blocks at whole factors. Monitor lookups no longer lose windows below
-96 DPI.
+Vulkan swapchain reduces the image to the monitor with NVIDIA's DSR
+filter, a Gaussian in linear light with WINE_DSR_SMOOTHNESS. An asset
+directory in WINE_DLDSR_PATH enables NVIDIA's native DL-DSR kernels
+for 1.78x and 2.25x SDR downscaling through NVX binary import, with DSR
+as the setup fallback. Monitor lookups preserve windows below 96 DPI.
 ---
- dlls/win32u/sysparams.c                | 147 ++++++++++++++++-
- dlls/win32u/vulkan.c                   | 209 ++++++++++++++++++++++++-
+ dlls/win32u/sysparams.c                | 147 +++-
+ dlls/win32u/vulkan.c                   | 920 +++++++++++++++++++++++++-
+ include/wine/vulkan_driver.h           |   3 +
  dlls/winewayland.drv/wayland_pointer.c |   8 +
- 3 files changed, 355 insertions(+), 9 deletions(-)
+ 4 files changed, 1058 insertions(+), 20 deletions(-)
 
 diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
 index 43d15857c99..1848bd37c35 100644
@@ -251,21 +254,260 @@ index 43d15857c99..1848bd37c35 100644
      {
          const char *decorate = NULL;
 diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
-index 2c89ae31dbc..1d139eee629 100644
+index 2c89ae31dbc..d04b2cf7f2c 100644
 --- a/dlls/win32u/vulkan.c
 +++ b/dlls/win32u/vulkan.c
-@@ -259,6 +259,10 @@ struct fs_hack_upscaler
+@@ -27,6 +27,8 @@
+ #include <assert.h>
+ #include <limits.h>
+ #include <math.h>
++#include <stdio.h>
++#include <fcntl.h>
+ #include <dlfcn.h>
+ #include <pthread.h>
+ #include <time.h>
+@@ -259,6 +261,11 @@ struct fs_hack_upscaler
      enum fs_hack_color_mode color_mode;
      BOOL is_blit, is_fsr, is_nis;
      BOOL linear_filter;
-+    /* DSR: the application image is a whole multiple of the presentation size per axis
-+     * and every presented pixel is the mean of its box_x x box_y block of stored values */
-+    BOOL is_box;
-+    uint32_t box_x, box_y;
++    /* DSR: the application image is larger than the presentation size and the presented image
++     * comes from NVIDIA's DSR filter, a Gaussian in linear light */
++    BOOL is_dsr;
++    BOOL is_dldsr;
++    float dsr_k, dsr_ratio[2];
      union {
          struct {
          } blit;
-@@ -2983,6 +2987,166 @@ out:
+@@ -285,6 +292,65 @@ static BOOL fs_hack_is_integer(void)
+     return is_int;
+ }
+ 
++/* Return the DSR smoothness from 0 to 1, NVIDIA's DSR smoothness setting (WINE_DSR_SMOOTHNESS in percent) */
++static float fs_hack_dsr_smoothness(void)
++{
++    static float smoothness = -1.0f;
++    if (smoothness < 0.0f)
++    {
++        const char *e = getenv( "WINE_DSR_SMOOTHNESS" );
++        float percent = e ? strtof( e, NULL ) : 0.0f;
++        if (!(percent >= 0.0f)) percent = 0.0f;
++        if (percent > 100.0f) percent = 100.0f;
++        smoothness = percent / 100.0f;
++        TRACE( "dsr_smoothness: %.2f\n", smoothness );
++    }
++    return smoothness;
++}
++
++/* The exp2 coefficient of NVIDIA's DSR Gaussian for a scale per axis and a smoothness from 0 to 1
++ * (driver 621.14). Each step rounds to float as in the driver, and the division by ln 2 is in double.
++ * Scale 2 gives 0xc15bd6d6 at smoothness 0, 0xbf793425 at 0.33 and 0xbe5bd6db at 1. */
++static float dsr_coefficient( float scale, float smoothness )
++{
++    volatile float minimum, range, width, variance, exponent;
++
++    minimum = 0.5f / scale;
++    minimum = minimum + 0.025f;
++    range = 0.5f - minimum;
++    range = range * 3.0f;
++    width = smoothness * range;
++    width = width + minimum;
++    width = width * scale;
++    variance = width * width;
++    variance = variance - 0.25f;
++    exponent = variance + variance;
++    exponent = -1.0f / exponent;
++    return (float)((double)exponent / log( 2.0 ));
++}
++
++/* The scale per axis of a DSR desktop for the coefficient, and the source pixels for each destination
++ * pixel. NVIDIA's driver stores each DSR factor as its scale per axis times 10000 and draws a source
++ * extent into ceil(extent / scale) destination pixels, with 1 / scale as a float. */
++static void dsr_axis( UINT src, UINT dst, float *scale, float *ratio )
++{
++    static const UINT nvidia[] = { 10954, 12247, 13333, 14142, 15000, 17320, 20000 };
++    UINT i;
++
++    *scale = *ratio = (float)src / dst;
++    for (i = 0; i < ARRAY_SIZE(nvidia); i++)
++    {
++        volatile float inverse, extent;
++
++        if ((UINT)floor( dst * (nvidia[i] / 10000.0) + 0.5 ) != src) continue;
++        *scale = (float)nvidia[i] / 10000.0f;
++        inverse = 1.0f / *scale;
++        extent = (float)src * inverse;
++        *ratio = (float)src / (float)ceil( extent );
++        return;
++    }
++}
++
+ struct fs_hack_image
+ {
+     uint32_t cmd_queue_idx;
+@@ -295,8 +361,37 @@ struct fs_hack_image
+     VkSemaphore blit_finished;
+     VkImageView user_view, swapchain_view, fsr_view;
+     VkDescriptorSet descriptor_set, fsr_set;
++    VkImageView dldsr_view;
++    uint32_t dldsr_texture, dldsr_sampler, dldsr_surface;
+ };
+ 
++struct fs_hack_dldsr
++{
++    VkCuModuleNVX module;
++    VkCuFunctionNVX function;
++    VkBuffer weights;
++    VkDeviceMemory memory;
++    VkDeviceAddress address;
++    VkPipelineLayout layout;
++    VkSampler sampler;
++    VkFormat source_format;
++    UINT model;
++};
++
++/* NVIDIA's parameter ABI, with the Vulkan sampler index appended. */
++struct fs_hack_dldsr_params
++{
++    uint32_t surface, texture;
++    float inv_width, inv_height, sharpen;
++    uint32_t format_flag;
++    uint64_t weights;
++    uint32_t sampler, padding;
++};
++
++C_ASSERT(sizeof(struct fs_hack_dldsr_params) == 40);
++C_ASSERT(offsetof(struct fs_hack_dldsr_params, weights) == 24);
++C_ASSERT(offsetof(struct fs_hack_dldsr_params, sampler) == 32);
++
+ struct fs_comp_pipeline
+ {
+     VkPipelineLayout pipeline_layout;
+@@ -487,6 +582,7 @@ struct swapchain
+     VkDescriptorSetLayout descriptor_set_layout;
+     VkFormat format;
+     struct fs_hack_upscaler upscaler;
++    struct fs_hack_dldsr dldsr;
+ 
+     struct fs_comp_pipeline blit_pipeline;
+     struct fs_comp_pipeline fsr_easu_pipeline;
+@@ -1220,6 +1316,8 @@ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_crea
+     pthread_key_create(&instance->obj.transient_object_handle, free);
+ 
+     if ((res = convert_instance_create_info( &pool, create_info, instance ))) goto failed;
++    instance->obj.api_version = create_info->pApplicationInfo && create_info->pApplicationInfo->apiVersion ?
++                                create_info->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
+     driver_layer_count = create_info->enabledLayerCount;
+     callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext,
+                                      VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK );
+@@ -1324,6 +1422,98 @@ static void parse_device_extensions( struct vulkan_device_extensions *extensions
+     if (next > str) add_device_extension( str, next - str, extensions );
+ }
+ 
++/* The asset directory opts this device into DL-DSR. Keep the ordinary DSR path
++ * available when any optional host capability is missing. The NVX importer
++ * validates the cubin's SM target before a function can be launched. */
++static void fs_hack_enable_dldsr( struct vulkan_physical_device *physical_device, VkDeviceCreateInfo *info,
++                                  struct mempool *pool, struct vulkan_device *device )
++{
++    struct vulkan_instance *instance = physical_device->instance;
++    VkPhysicalDeviceBufferDeviceAddressFeatures support = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
++    VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &support};
++    VkPhysicalDeviceBufferDeviceAddressFeatures *bda;
++    VkPhysicalDeviceVulkan12Features *v12;
++    const VkDeviceGroupDeviceCreateInfo *group;
++    VkPhysicalDeviceProperties properties;
++    /* VK_NV_cuda_kernel_launch is provisional and omitted from Wine's public
++     * headers. Query its host property ABI solely to choose the cubin target. */
++    struct
++    {
++        VkStructureType sType;
++        void *pNext;
++        uint32_t computeCapabilityMinor, computeCapabilityMajor;
++    } cuda_properties = {(VkStructureType)1000307004};
++    VkPhysicalDeviceProperties2 properties2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &cuda_properties};
++    VkExtensionProperties *extensions;
++    PFN_vkGetPhysicalDeviceFeatures2 get_features;
++    PFN_vkGetPhysicalDeviceProperties2 get_properties2;
++    const char *path = getenv( "WINE_DLDSR_PATH" );
++    uint32_t count = 0, i, binary_version = 0, image_version = 0, sm;
++    BOOL cuda_properties_supported = FALSE;
++    VkResult res;
++
++    if (sizeof(void *) != 8 || !path || !*path || instance->api_version < VK_API_VERSION_1_1 ||
++        !device->extensions.has_VK_KHR_swapchain ||
++        !physical_device->extensions.has_VK_NVX_binary_import ||
++        !physical_device->extensions.has_VK_NVX_image_view_handle ||
++        !physical_device->extensions.has_VK_KHR_buffer_device_address ||
++        device->extensions.has_VK_EXT_buffer_device_address) return;
++
++    group = find_next_struct( info, VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO );
++    if (group && group->physicalDeviceCount > 1) return;
++    instance->p_vkGetPhysicalDeviceProperties( physical_device->host.physical_device, &properties );
++    if (properties.vendorID != 0x10de || properties.apiVersion < VK_API_VERSION_1_1) return;
++
++    get_features = instance->p_vkGetPhysicalDeviceFeatures2;
++    if (!get_features) get_features = instance->p_vkGetPhysicalDeviceFeatures2KHR;
++    if (!get_features) return;
++    get_features( physical_device->host.physical_device, &features );
++    if (!support.bufferDeviceAddress) return;
++
++    res = instance->p_vkEnumerateDeviceExtensionProperties( physical_device->host.physical_device, NULL, &count, NULL );
++    if (res || !count || !(extensions = calloc( count, sizeof(*extensions) ))) return;
++    res = instance->p_vkEnumerateDeviceExtensionProperties( physical_device->host.physical_device, NULL, &count, extensions );
++    if (!res)
++        for (i = 0; i < count; i++)
++        {
++            if (!strcmp( extensions[i].extensionName, VK_NVX_BINARY_IMPORT_EXTENSION_NAME ))
++                binary_version = extensions[i].specVersion;
++            if (!strcmp( extensions[i].extensionName, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME ))
++                image_version = extensions[i].specVersion;
++            if (!strcmp( extensions[i].extensionName, "VK_NV_cuda_kernel_launch" ))
++                cuda_properties_supported = TRUE;
++        }
++    free( extensions );
++    if (binary_version < 2 || image_version < 4 || !cuda_properties_supported) return;
++    get_properties2 = instance->p_vkGetPhysicalDeviceProperties2;
++    if (!get_properties2) get_properties2 = instance->p_vkGetPhysicalDeviceProperties2KHR;
++    if (!get_properties2) return;
++    get_properties2( physical_device->host.physical_device, &properties2 );
++    sm = cuda_properties.computeCapabilityMajor * 10 + cuda_properties.computeCapabilityMinor;
++    /* Ada executes Ampere's SM86 binary (same major, later minor). */
++    if (sm == 89) sm = 86;
++    if (sm != 75 && sm != 86 && sm != 120 && sm != 121) return;
++
++    v12 = (void *)find_next_struct( info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES );
++    bda = (void *)find_next_struct( info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES );
++    if (v12) v12->bufferDeviceAddress = VK_TRUE;
++    else if (bda) bda->bufferDeviceAddress = VK_TRUE;
++    else
++    {
++        if (!(bda = mem_alloc( pool, sizeof(*bda) ))) return;
++        *bda = support;
++        bda->bufferDeviceAddressCaptureReplay = VK_FALSE;
++        bda->bufferDeviceAddressMultiDevice = VK_FALSE;
++        bda->pNext = (void *)info->pNext;
++        info->pNext = bda;
++    }
++    device->extensions.has_VK_KHR_buffer_device_address = 1;
++    device->extensions.has_VK_NVX_binary_import = 1;
++    device->extensions.has_VK_NVX_image_view_handle = 1;
++    device->dldsr_sm = sm;
++    device->dldsr_enabled = TRUE;
++}
++
+ static VkResult convert_device_create_info( struct vulkan_physical_device *physical_device, VkDeviceCreateInfo *info,
+                                             struct mempool *pool, struct vulkan_device *device )
+ {
+@@ -1411,6 +1601,8 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
+         }
+     }
+ 
++    fs_hack_enable_dldsr( physical_device, info, pool, device );
++
+     if (!(extensions = mem_alloc( pool, sizeof(device->extensions) * 8 * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+ #define USE_VK_EXT(x) if (device->extensions.has_ ## x) extensions[count++] = #x;
+     ALL_VK_DEVICE_EXTS
+@@ -2983,6 +3175,366 @@ out:
      return res;
  }
  
@@ -277,10 +519,35 @@ index 2c89ae31dbc..1d139eee629 100644
 +layout(binding = 0) uniform sampler2D texSampler;
 +layout(binding = 1) uniform writeonly image2D outImage;
 +layout(push_constant) uniform pushConstants {
-+    // destination rectangle origin in the real image and the integer reduction per axis
-+    uvec2 offset;
-+    uvec2 factor;
++    // destination rectangle origin in the real image, source pixels for each destination pixel,
++    // and the exp2 coefficient of the Gaussian
++    vec2 offset;
++    vec2 ratio;
++    float k;
 +} constants;
++
++// Six Gaussian weights around the source center, as three bilinear pairs
++void dsr_axis(float center, out vec3 positions, out vec3 weights)
++{
++    float p = roundEven(center) + 0.5;
++    float d = p - center;
++    float w0 = exp2(constants.k * (d - 3.0) * (d - 3.0));
++    float w1 = exp2(constants.k * (d - 2.0) * (d - 2.0));
++    float w2 = exp2(constants.k * (d - 1.0) * (d - 1.0));
++    float w3 = exp2(constants.k * d * d);
++    float w4 = exp2(constants.k * (d + 1.0) * (d + 1.0));
++    float w5 = exp2(constants.k * (d + 2.0) * (d + 2.0));
++    weights = vec3(w0 + w1, w2 + w3, w4 + w5);
++    positions = vec3(p - 3.0 + w1 / weights.x, p - 1.0 + w3 / weights.y, p + 1.0 + w5 / weights.z);
++}
++
++vec3 dsr_row(vec3 x, float y, vec3 wx)
++{
++    vec3 middle = textureLod(texSampler, vec2(x.y, y), 0.0).rgb;
++    vec3 left = textureLod(texSampler, vec2(x.x, y), 0.0).rgb;
++    vec3 right = textureLod(texSampler, vec2(x.z, y), 0.0).rgb;
++    return (middle * wx.y + left * wx.x + right * wx.z) / (wx.y + wx.x + wx.z);
++}
 +
 +void main()
 +{
@@ -289,171 +556,643 @@ index 2c89ae31dbc..1d139eee629 100644
 +    if (dst.x >= size.x || dst.y >= size.y)
 +        return;
 +
-+    ivec2 k = ivec2(constants.factor);
-+    ivec2 base = (dst - ivec2(constants.offset)) * k;
-+    ivec2 src_size = textureSize(texSampler, 0);
-+    if (base.x < 0 || base.y < 0 || base.x + k.x > src_size.x || base.y + k.y > src_size.y)
++    vec2 src_size = vec2(textureSize(texSampler, 0));
++    vec2 pixel = vec2(dst) - constants.offset;
++    vec2 center = (pixel + 0.5) * constants.ratio;
++    if (pixel.x < 0.0 || pixel.y < 0.0 || center.x > src_size.x || center.y > src_size.y)
 +    {
 +        imageStore(outImage, dst, vec4(0.0, 0.0, 0.0, 1.0));
 +        return;
 +    }
 +
-+    // Each output pixel is the exact mean of its k x k block of stored values
-+    vec4 sum = vec4(0.0);
-+    for (int y = 0; y < k.y; ++y)
-+        for (int x = 0; x < k.x; ++x)
-+            sum += texelFetch(texSampler, base + ivec2(x, y), 0);
-+    imageStore(outImage, dst, sum / float(k.x * k.y));
++    // NVIDIA's DSR filter (driver 621.14, shader 0xb117324b): a 6x6 Gaussian in linear light from nine
++    // bilinear fetches. The sampler decodes sRGB before it interpolates and takes coordinates in source
++    // pixels, as in the driver's program. The driver adds 2^-15 to source coordinates.
++    center += 1.0 / 32768.0;
++    vec3 x, y, wx, wy;
++    dsr_axis(center.x, x, wx);
++    dsr_axis(center.y, y, wy);
++    vec3 top = dsr_row(x, y.x, wx);
++    vec3 middle = dsr_row(x, y.y, wx);
++    vec3 bottom = dsr_row(x, y.z, wx);
++    vec3 c = (middle * wy.y + top * wy.x + bottom * wy.z) / (wy.y + wy.x + wy.z);
++
++    // Convert linear -> srgb
++    bvec3 isLo = lessThanEqual(c, vec3(0.0031308f));
++    vec3 loPart = c * 12.92f;
++    vec3 hiPart = pow(c, vec3(5.0f / 12.0f)) * 1.055f - 0.055f;
++    c = mix(hiPart, loPart, isLo);
++
++    imageStore(outImage, dst, vec4(c, 1.0));
 +}
 +
 +*/
-+const uint32_t box_comp_spv[] =
++const uint32_t dsr_comp_spv[] =
 +{
-+    0x07230203, 0x00010000, 0x0008000b, 0x000000a5, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
++    0x07230203, 0x00010000, 0x0008000b, 0x00000188, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
 +    0x00000032, 0x00020011, 0x00000038, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
 +    0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0006000f, 0x00000005, 0x00000004, 0x6e69616d,
-+    0x00000000, 0x0000000d, 0x00060010, 0x00000004, 0x00000011, 0x00000008, 0x00000008, 0x00000001,
-+    0x00030003, 0x00000002, 0x000001cc, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005,
-+    0x00000009, 0x00747364, 0x00080005, 0x0000000d, 0x475f6c67, 0x61626f6c, 0x766e496c, 0x7461636f,
-+    0x496e6f69, 0x00000044, 0x00040005, 0x00000012, 0x657a6973, 0x00000000, 0x00050005, 0x00000016,
-+    0x4974756f, 0x6567616d, 0x00000000, 0x00030005, 0x0000002e, 0x0000006b, 0x00060005, 0x0000002f,
-+    0x68737570, 0x736e6f43, 0x746e6174, 0x00000073, 0x00050006, 0x0000002f, 0x00000000, 0x7366666f,
-+    0x00007465, 0x00050006, 0x0000002f, 0x00000001, 0x74636166, 0x0000726f, 0x00050005, 0x00000031,
-+    0x736e6f63, 0x746e6174, 0x00000073, 0x00040005, 0x00000037, 0x65736162, 0x00000000, 0x00050005,
-+    0x00000040, 0x5f637273, 0x657a6973, 0x00000000, 0x00050005, 0x00000044, 0x53786574, 0x6c706d61,
-+    0x00007265, 0x00030005, 0x00000074, 0x006d7573, 0x00030005, 0x00000076, 0x00000079, 0x00030005,
-+    0x00000080, 0x00000078, 0x00040047, 0x0000000d, 0x0000000b, 0x0000001c, 0x00030047, 0x00000016,
-+    0x00000019, 0x00040047, 0x00000016, 0x00000021, 0x00000001, 0x00040047, 0x00000016, 0x00000022,
-+    0x00000000, 0x00030047, 0x0000002f, 0x00000002, 0x00050048, 0x0000002f, 0x00000000, 0x00000023,
-+    0x00000000, 0x00050048, 0x0000002f, 0x00000001, 0x00000023, 0x00000008, 0x00040047, 0x00000044,
-+    0x00000021, 0x00000000, 0x00040047, 0x00000044, 0x00000022, 0x00000000, 0x00040047, 0x000000a4,
-+    0x0000000b, 0x00000019, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015,
-+    0x00000006, 0x00000020, 0x00000001, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020,
-+    0x00000008, 0x00000007, 0x00000007, 0x00040015, 0x0000000a, 0x00000020, 0x00000000, 0x00040017,
-+    0x0000000b, 0x0000000a, 0x00000003, 0x00040020, 0x0000000c, 0x00000001, 0x0000000b, 0x0004003b,
-+    0x0000000c, 0x0000000d, 0x00000001, 0x00040017, 0x0000000e, 0x0000000a, 0x00000002, 0x00030016,
-+    0x00000013, 0x00000020, 0x00090019, 0x00000014, 0x00000013, 0x00000001, 0x00000000, 0x00000000,
-+    0x00000000, 0x00000002, 0x00000000, 0x00040020, 0x00000015, 0x00000000, 0x00000014, 0x0004003b,
-+    0x00000015, 0x00000016, 0x00000000, 0x00020014, 0x00000019, 0x0004002b, 0x0000000a, 0x0000001a,
-+    0x00000000, 0x00040020, 0x0000001b, 0x00000007, 0x00000006, 0x0004002b, 0x0000000a, 0x00000024,
-+    0x00000001, 0x0004001e, 0x0000002f, 0x0000000e, 0x0000000e, 0x00040020, 0x00000030, 0x00000009,
-+    0x0000002f, 0x0004003b, 0x00000030, 0x00000031, 0x00000009, 0x0004002b, 0x00000006, 0x00000032,
-+    0x00000001, 0x00040020, 0x00000033, 0x00000009, 0x0000000e, 0x0004002b, 0x00000006, 0x00000039,
-+    0x00000000, 0x00090019, 0x00000041, 0x00000013, 0x00000001, 0x00000000, 0x00000000, 0x00000000,
-+    0x00000001, 0x00000000, 0x0003001b, 0x00000042, 0x00000041, 0x00040020, 0x00000043, 0x00000000,
-+    0x00000042, 0x0004003b, 0x00000043, 0x00000044, 0x00000000, 0x00040017, 0x0000006e, 0x00000013,
-+    0x00000004, 0x0004002b, 0x00000013, 0x0000006f, 0x00000000, 0x0004002b, 0x00000013, 0x00000070,
-+    0x3f800000, 0x0007002c, 0x0000006e, 0x00000071, 0x0000006f, 0x0000006f, 0x0000006f, 0x00000070,
-+    0x00040020, 0x00000073, 0x00000007, 0x0000006e, 0x0007002c, 0x0000006e, 0x00000075, 0x0000006f,
-+    0x0000006f, 0x0000006f, 0x0000006f, 0x0004002b, 0x0000000a, 0x000000a3, 0x00000008, 0x0006002c,
-+    0x0000000b, 0x000000a4, 0x000000a3, 0x000000a3, 0x00000024, 0x00050036, 0x00000002, 0x00000004,
-+    0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009, 0x00000007,
-+    0x0004003b, 0x00000008, 0x00000012, 0x00000007, 0x0004003b, 0x00000008, 0x0000002e, 0x00000007,
-+    0x0004003b, 0x00000008, 0x00000037, 0x00000007, 0x0004003b, 0x00000008, 0x00000040, 0x00000007,
-+    0x0004003b, 0x00000073, 0x00000074, 0x00000007, 0x0004003b, 0x0000001b, 0x00000076, 0x00000007,
-+    0x0004003b, 0x0000001b, 0x00000080, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000f, 0x0000000d,
-+    0x0007004f, 0x0000000e, 0x00000010, 0x0000000f, 0x0000000f, 0x00000000, 0x00000001, 0x0004007c,
-+    0x00000007, 0x00000011, 0x00000010, 0x0003003e, 0x00000009, 0x00000011, 0x0004003d, 0x00000014,
-+    0x00000017, 0x00000016, 0x00040068, 0x00000007, 0x00000018, 0x00000017, 0x0003003e, 0x00000012,
-+    0x00000018, 0x00050041, 0x0000001b, 0x0000001c, 0x00000009, 0x0000001a, 0x0004003d, 0x00000006,
-+    0x0000001d, 0x0000001c, 0x00050041, 0x0000001b, 0x0000001e, 0x00000012, 0x0000001a, 0x0004003d,
-+    0x00000006, 0x0000001f, 0x0000001e, 0x000500af, 0x00000019, 0x00000020, 0x0000001d, 0x0000001f,
-+    0x000400a8, 0x00000019, 0x00000021, 0x00000020, 0x000300f7, 0x00000023, 0x00000000, 0x000400fa,
-+    0x00000021, 0x00000022, 0x00000023, 0x000200f8, 0x00000022, 0x00050041, 0x0000001b, 0x00000025,
-+    0x00000009, 0x00000024, 0x0004003d, 0x00000006, 0x00000026, 0x00000025, 0x00050041, 0x0000001b,
-+    0x00000027, 0x00000012, 0x00000024, 0x0004003d, 0x00000006, 0x00000028, 0x00000027, 0x000500af,
-+    0x00000019, 0x00000029, 0x00000026, 0x00000028, 0x000200f9, 0x00000023, 0x000200f8, 0x00000023,
-+    0x000700f5, 0x00000019, 0x0000002a, 0x00000020, 0x00000005, 0x00000029, 0x00000022, 0x000300f7,
-+    0x0000002c, 0x00000000, 0x000400fa, 0x0000002a, 0x0000002b, 0x0000002c, 0x000200f8, 0x0000002b,
-+    0x000100fd, 0x000200f8, 0x0000002c, 0x00050041, 0x00000033, 0x00000034, 0x00000031, 0x00000032,
-+    0x0004003d, 0x0000000e, 0x00000035, 0x00000034, 0x0004007c, 0x00000007, 0x00000036, 0x00000035,
-+    0x0003003e, 0x0000002e, 0x00000036, 0x0004003d, 0x00000007, 0x00000038, 0x00000009, 0x00050041,
-+    0x00000033, 0x0000003a, 0x00000031, 0x00000039, 0x0004003d, 0x0000000e, 0x0000003b, 0x0000003a,
-+    0x0004007c, 0x00000007, 0x0000003c, 0x0000003b, 0x00050082, 0x00000007, 0x0000003d, 0x00000038,
-+    0x0000003c, 0x0004003d, 0x00000007, 0x0000003e, 0x0000002e, 0x00050084, 0x00000007, 0x0000003f,
-+    0x0000003d, 0x0000003e, 0x0003003e, 0x00000037, 0x0000003f, 0x0004003d, 0x00000042, 0x00000045,
-+    0x00000044, 0x00040064, 0x00000041, 0x00000046, 0x00000045, 0x00050067, 0x00000007, 0x00000047,
-+    0x00000046, 0x00000039, 0x0003003e, 0x00000040, 0x00000047, 0x00050041, 0x0000001b, 0x00000048,
-+    0x00000037, 0x0000001a, 0x0004003d, 0x00000006, 0x00000049, 0x00000048, 0x000500b1, 0x00000019,
-+    0x0000004a, 0x00000049, 0x00000039, 0x000400a8, 0x00000019, 0x0000004b, 0x0000004a, 0x000300f7,
-+    0x0000004d, 0x00000000, 0x000400fa, 0x0000004b, 0x0000004c, 0x0000004d, 0x000200f8, 0x0000004c,
-+    0x00050041, 0x0000001b, 0x0000004e, 0x00000037, 0x00000024, 0x0004003d, 0x00000006, 0x0000004f,
-+    0x0000004e, 0x000500b1, 0x00000019, 0x00000050, 0x0000004f, 0x00000039, 0x000200f9, 0x0000004d,
-+    0x000200f8, 0x0000004d, 0x000700f5, 0x00000019, 0x00000051, 0x0000004a, 0x0000002c, 0x00000050,
-+    0x0000004c, 0x000400a8, 0x00000019, 0x00000052, 0x00000051, 0x000300f7, 0x00000054, 0x00000000,
-+    0x000400fa, 0x00000052, 0x00000053, 0x00000054, 0x000200f8, 0x00000053, 0x00050041, 0x0000001b,
-+    0x00000055, 0x00000037, 0x0000001a, 0x0004003d, 0x00000006, 0x00000056, 0x00000055, 0x00050041,
-+    0x0000001b, 0x00000057, 0x0000002e, 0x0000001a, 0x0004003d, 0x00000006, 0x00000058, 0x00000057,
-+    0x00050080, 0x00000006, 0x00000059, 0x00000056, 0x00000058, 0x00050041, 0x0000001b, 0x0000005a,
-+    0x00000040, 0x0000001a, 0x0004003d, 0x00000006, 0x0000005b, 0x0000005a, 0x000500ad, 0x00000019,
-+    0x0000005c, 0x00000059, 0x0000005b, 0x000200f9, 0x00000054, 0x000200f8, 0x00000054, 0x000700f5,
-+    0x00000019, 0x0000005d, 0x00000051, 0x0000004d, 0x0000005c, 0x00000053, 0x000400a8, 0x00000019,
-+    0x0000005e, 0x0000005d, 0x000300f7, 0x00000060, 0x00000000, 0x000400fa, 0x0000005e, 0x0000005f,
-+    0x00000060, 0x000200f8, 0x0000005f, 0x00050041, 0x0000001b, 0x00000061, 0x00000037, 0x00000024,
-+    0x0004003d, 0x00000006, 0x00000062, 0x00000061, 0x00050041, 0x0000001b, 0x00000063, 0x0000002e,
-+    0x00000024, 0x0004003d, 0x00000006, 0x00000064, 0x00000063, 0x00050080, 0x00000006, 0x00000065,
-+    0x00000062, 0x00000064, 0x00050041, 0x0000001b, 0x00000066, 0x00000040, 0x00000024, 0x0004003d,
-+    0x00000006, 0x00000067, 0x00000066, 0x000500ad, 0x00000019, 0x00000068, 0x00000065, 0x00000067,
-+    0x000200f9, 0x00000060, 0x000200f8, 0x00000060, 0x000700f5, 0x00000019, 0x00000069, 0x0000005d,
-+    0x00000054, 0x00000068, 0x0000005f, 0x000300f7, 0x0000006b, 0x00000000, 0x000400fa, 0x00000069,
-+    0x0000006a, 0x0000006b, 0x000200f8, 0x0000006a, 0x0004003d, 0x00000014, 0x0000006c, 0x00000016,
-+    0x0004003d, 0x00000007, 0x0000006d, 0x00000009, 0x00040063, 0x0000006c, 0x0000006d, 0x00000071,
-+    0x000100fd, 0x000200f8, 0x0000006b, 0x0003003e, 0x00000074, 0x00000075, 0x0003003e, 0x00000076,
-+    0x00000039, 0x000200f9, 0x00000077, 0x000200f8, 0x00000077, 0x000400f6, 0x00000079, 0x0000007a,
-+    0x00000000, 0x000200f9, 0x0000007b, 0x000200f8, 0x0000007b, 0x0004003d, 0x00000006, 0x0000007c,
-+    0x00000076, 0x00050041, 0x0000001b, 0x0000007d, 0x0000002e, 0x00000024, 0x0004003d, 0x00000006,
-+    0x0000007e, 0x0000007d, 0x000500b1, 0x00000019, 0x0000007f, 0x0000007c, 0x0000007e, 0x000400fa,
-+    0x0000007f, 0x00000078, 0x00000079, 0x000200f8, 0x00000078, 0x0003003e, 0x00000080, 0x00000039,
-+    0x000200f9, 0x00000081, 0x000200f8, 0x00000081, 0x000400f6, 0x00000083, 0x00000084, 0x00000000,
-+    0x000200f9, 0x00000085, 0x000200f8, 0x00000085, 0x0004003d, 0x00000006, 0x00000086, 0x00000080,
-+    0x00050041, 0x0000001b, 0x00000087, 0x0000002e, 0x0000001a, 0x0004003d, 0x00000006, 0x00000088,
-+    0x00000087, 0x000500b1, 0x00000019, 0x00000089, 0x00000086, 0x00000088, 0x000400fa, 0x00000089,
-+    0x00000082, 0x00000083, 0x000200f8, 0x00000082, 0x0004003d, 0x00000042, 0x0000008a, 0x00000044,
-+    0x0004003d, 0x00000007, 0x0000008b, 0x00000037, 0x0004003d, 0x00000006, 0x0000008c, 0x00000080,
-+    0x0004003d, 0x00000006, 0x0000008d, 0x00000076, 0x00050050, 0x00000007, 0x0000008e, 0x0000008c,
-+    0x0000008d, 0x00050080, 0x00000007, 0x0000008f, 0x0000008b, 0x0000008e, 0x00040064, 0x00000041,
-+    0x00000090, 0x0000008a, 0x0007005f, 0x0000006e, 0x00000091, 0x00000090, 0x0000008f, 0x00000002,
-+    0x00000039, 0x0004003d, 0x0000006e, 0x00000092, 0x00000074, 0x00050081, 0x0000006e, 0x00000093,
-+    0x00000092, 0x00000091, 0x0003003e, 0x00000074, 0x00000093, 0x000200f9, 0x00000084, 0x000200f8,
-+    0x00000084, 0x0004003d, 0x00000006, 0x00000094, 0x00000080, 0x00050080, 0x00000006, 0x00000095,
-+    0x00000094, 0x00000032, 0x0003003e, 0x00000080, 0x00000095, 0x000200f9, 0x00000081, 0x000200f8,
-+    0x00000083, 0x000200f9, 0x0000007a, 0x000200f8, 0x0000007a, 0x0004003d, 0x00000006, 0x00000096,
-+    0x00000076, 0x00050080, 0x00000006, 0x00000097, 0x00000096, 0x00000032, 0x0003003e, 0x00000076,
-+    0x00000097, 0x000200f9, 0x00000077, 0x000200f8, 0x00000079, 0x0004003d, 0x00000014, 0x00000098,
-+    0x00000016, 0x0004003d, 0x00000007, 0x00000099, 0x00000009, 0x0004003d, 0x0000006e, 0x0000009a,
-+    0x00000074, 0x00050041, 0x0000001b, 0x0000009b, 0x0000002e, 0x0000001a, 0x0004003d, 0x00000006,
-+    0x0000009c, 0x0000009b, 0x00050041, 0x0000001b, 0x0000009d, 0x0000002e, 0x00000024, 0x0004003d,
-+    0x00000006, 0x0000009e, 0x0000009d, 0x00050084, 0x00000006, 0x0000009f, 0x0000009c, 0x0000009e,
-+    0x0004006f, 0x00000013, 0x000000a0, 0x0000009f, 0x00070050, 0x0000006e, 0x000000a1, 0x000000a0,
-+    0x000000a0, 0x000000a0, 0x000000a0, 0x00050088, 0x0000006e, 0x000000a2, 0x0000009a, 0x000000a1,
-+    0x00040063, 0x00000098, 0x00000099, 0x000000a2, 0x000100fd, 0x00010038,
++    0x00000000, 0x000000c4, 0x00060010, 0x00000004, 0x00000011, 0x00000008, 0x00000008, 0x00000001,
++    0x00030003, 0x00000002, 0x000001cc, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00080005,
++    0x0000000e, 0x5f727364, 0x73697861, 0x3b316628, 0x3b336676, 0x3b336676, 0x00000000, 0x00040005,
++    0x0000000b, 0x746e6563, 0x00007265, 0x00050005, 0x0000000c, 0x69736f70, 0x6e6f6974, 0x00000073,
++    0x00040005, 0x0000000d, 0x67696577, 0x00737468, 0x00070005, 0x00000014, 0x5f727364, 0x28776f72,
++    0x3b336676, 0x763b3166, 0x003b3366, 0x00030005, 0x00000011, 0x00000078, 0x00030005, 0x00000012,
++    0x00000079, 0x00030005, 0x00000013, 0x00007877, 0x00030005, 0x00000016, 0x00000070, 0x00030005,
++    0x0000001b, 0x00000064, 0x00030005, 0x0000001f, 0x00003077, 0x00060005, 0x00000021, 0x68737570,
++    0x736e6f43, 0x746e6174, 0x00000073, 0x00050006, 0x00000021, 0x00000000, 0x7366666f, 0x00007465,
++    0x00050006, 0x00000021, 0x00000001, 0x69746172, 0x0000006f, 0x00040006, 0x00000021, 0x00000002,
++    0x0000006b, 0x00050005, 0x00000023, 0x736e6f63, 0x746e6174, 0x00000073, 0x00030005, 0x00000031,
++    0x00003177, 0x00030005, 0x0000003c, 0x00003277, 0x00030005, 0x00000047, 0x00003377, 0x00030005,
++    0x0000004f, 0x00003477, 0x00030005, 0x00000059, 0x00003577, 0x00040005, 0x00000087, 0x6464696d,
++    0x0000656c, 0x00050005, 0x0000008b, 0x53786574, 0x6c706d61, 0x00007265, 0x00040005, 0x00000095,
++    0x7466656c, 0x00000000, 0x00040005, 0x0000009d, 0x68676972, 0x00000074, 0x00030005, 0x000000c1,
++    0x00747364, 0x00080005, 0x000000c4, 0x475f6c67, 0x61626f6c, 0x766e496c, 0x7461636f, 0x496e6f69,
++    0x00000044, 0x00040005, 0x000000c9, 0x657a6973, 0x00000000, 0x00050005, 0x000000cc, 0x4974756f,
++    0x6567616d, 0x00000000, 0x00050005, 0x000000e3, 0x5f637273, 0x657a6973, 0x00000000, 0x00040005,
++    0x000000e9, 0x65786970, 0x0000006c, 0x00040005, 0x000000f0, 0x746e6563, 0x00007265, 0x00030005,
++    0x0000011e, 0x00000078, 0x00030005, 0x0000011f, 0x00007877, 0x00040005, 0x00000120, 0x61726170,
++    0x0000006d, 0x00040005, 0x00000123, 0x61726170, 0x0000006d, 0x00040005, 0x00000124, 0x61726170,
++    0x0000006d, 0x00030005, 0x00000128, 0x00000079, 0x00030005, 0x00000129, 0x00007977, 0x00040005,
++    0x0000012a, 0x61726170, 0x0000006d, 0x00040005, 0x0000012d, 0x61726170, 0x0000006d, 0x00040005,
++    0x0000012e, 0x61726170, 0x0000006d, 0x00030005, 0x00000132, 0x00706f74, 0x00040005, 0x00000133,
++    0x61726170, 0x0000006d, 0x00040005, 0x00000135, 0x61726170, 0x0000006d, 0x00040005, 0x00000138,
++    0x61726170, 0x0000006d, 0x00040005, 0x0000013b, 0x6464696d, 0x0000656c, 0x00040005, 0x0000013c,
++    0x61726170, 0x0000006d, 0x00040005, 0x0000013e, 0x61726170, 0x0000006d, 0x00040005, 0x00000141,
++    0x61726170, 0x0000006d, 0x00040005, 0x00000144, 0x74746f62, 0x00006d6f, 0x00040005, 0x00000145,
++    0x61726170, 0x0000006d, 0x00040005, 0x00000147, 0x61726170, 0x0000006d, 0x00040005, 0x0000014a,
++    0x61726170, 0x0000006d, 0x00030005, 0x0000014d, 0x00000063, 0x00040005, 0x00000168, 0x6f4c7369,
++    0x00000000, 0x00040005, 0x0000016d, 0x61506f6c, 0x00007472, 0x00040005, 0x00000171, 0x61506968,
++    0x00007472, 0x00030047, 0x00000021, 0x00000002, 0x00050048, 0x00000021, 0x00000000, 0x00000023,
++    0x00000000, 0x00050048, 0x00000021, 0x00000001, 0x00000023, 0x00000008, 0x00050048, 0x00000021,
++    0x00000002, 0x00000023, 0x00000010, 0x00040047, 0x0000008b, 0x00000021, 0x00000000, 0x00040047,
++    0x0000008b, 0x00000022, 0x00000000, 0x00040047, 0x000000c4, 0x0000000b, 0x0000001c, 0x00030047,
++    0x000000cc, 0x00000019, 0x00040047, 0x000000cc, 0x00000021, 0x00000001, 0x00040047, 0x000000cc,
++    0x00000022, 0x00000000, 0x00040047, 0x00000187, 0x0000000b, 0x00000019, 0x00020013, 0x00000002,
++    0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040020, 0x00000007,
++    0x00000007, 0x00000006, 0x00040017, 0x00000008, 0x00000006, 0x00000003, 0x00040020, 0x00000009,
++    0x00000007, 0x00000008, 0x00060021, 0x0000000a, 0x00000002, 0x00000007, 0x00000009, 0x00000009,
++    0x00060021, 0x00000010, 0x00000008, 0x00000009, 0x00000007, 0x00000009, 0x0004002b, 0x00000006,
++    0x00000019, 0x3f000000, 0x00040017, 0x00000020, 0x00000006, 0x00000002, 0x0005001e, 0x00000021,
++    0x00000020, 0x00000020, 0x00000006, 0x00040020, 0x00000022, 0x00000009, 0x00000021, 0x0004003b,
++    0x00000022, 0x00000023, 0x00000009, 0x00040015, 0x00000024, 0x00000020, 0x00000001, 0x0004002b,
++    0x00000024, 0x00000025, 0x00000002, 0x00040020, 0x00000026, 0x00000009, 0x00000006, 0x0004002b,
++    0x00000006, 0x0000002a, 0x40400000, 0x0004002b, 0x00000006, 0x00000035, 0x40000000, 0x0004002b,
++    0x00000006, 0x00000040, 0x3f800000, 0x00040015, 0x00000070, 0x00000020, 0x00000000, 0x0004002b,
++    0x00000070, 0x00000071, 0x00000000, 0x0004002b, 0x00000070, 0x00000079, 0x00000001, 0x0004002b,
++    0x00000070, 0x00000081, 0x00000002, 0x00090019, 0x00000088, 0x00000006, 0x00000001, 0x00000000,
++    0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x00000089, 0x00000088, 0x00040020,
++    0x0000008a, 0x00000000, 0x00000089, 0x0004003b, 0x0000008a, 0x0000008b, 0x00000000, 0x0004002b,
++    0x00000006, 0x00000091, 0x00000000, 0x00040017, 0x00000092, 0x00000006, 0x00000004, 0x00040017,
++    0x000000bf, 0x00000024, 0x00000002, 0x00040020, 0x000000c0, 0x00000007, 0x000000bf, 0x00040017,
++    0x000000c2, 0x00000070, 0x00000003, 0x00040020, 0x000000c3, 0x00000001, 0x000000c2, 0x0004003b,
++    0x000000c3, 0x000000c4, 0x00000001, 0x00040017, 0x000000c5, 0x00000070, 0x00000002, 0x00090019,
++    0x000000ca, 0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000002, 0x00000000,
++    0x00040020, 0x000000cb, 0x00000000, 0x000000ca, 0x0004003b, 0x000000cb, 0x000000cc, 0x00000000,
++    0x00020014, 0x000000cf, 0x00040020, 0x000000d0, 0x00000007, 0x00000024, 0x00040020, 0x000000e2,
++    0x00000007, 0x00000020, 0x0004002b, 0x00000024, 0x000000e5, 0x00000000, 0x00040020, 0x000000ec,
++    0x00000009, 0x00000020, 0x0004002b, 0x00000024, 0x000000f4, 0x00000001, 0x0007002c, 0x00000092,
++    0x00000118, 0x00000091, 0x00000091, 0x00000091, 0x00000040, 0x0004002b, 0x00000006, 0x0000011a,
++    0x38000000, 0x00040017, 0x00000166, 0x000000cf, 0x00000003, 0x00040020, 0x00000167, 0x00000007,
++    0x00000166, 0x0004002b, 0x00000006, 0x0000016a, 0x3b4d2e1c, 0x0006002c, 0x00000008, 0x0000016b,
++    0x0000016a, 0x0000016a, 0x0000016a, 0x0004002b, 0x00000006, 0x0000016f, 0x414eb852, 0x0004002b,
++    0x00000006, 0x00000173, 0x3ed55555, 0x0006002c, 0x00000008, 0x00000174, 0x00000173, 0x00000173,
++    0x00000173, 0x0004002b, 0x00000006, 0x00000176, 0x3f870a3d, 0x0004002b, 0x00000006, 0x00000178,
++    0x3d6147ae, 0x0004002b, 0x00000070, 0x00000186, 0x00000008, 0x0006002c, 0x000000c2, 0x00000187,
++    0x00000186, 0x00000186, 0x00000079, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003,
++    0x000200f8, 0x00000005, 0x0004003b, 0x000000c0, 0x000000c1, 0x00000007, 0x0004003b, 0x000000c0,
++    0x000000c9, 0x00000007, 0x0004003b, 0x000000e2, 0x000000e3, 0x00000007, 0x0004003b, 0x000000e2,
++    0x000000e9, 0x00000007, 0x0004003b, 0x000000e2, 0x000000f0, 0x00000007, 0x0004003b, 0x00000009,
++    0x0000011e, 0x00000007, 0x0004003b, 0x00000009, 0x0000011f, 0x00000007, 0x0004003b, 0x00000007,
++    0x00000120, 0x00000007, 0x0004003b, 0x00000009, 0x00000123, 0x00000007, 0x0004003b, 0x00000009,
++    0x00000124, 0x00000007, 0x0004003b, 0x00000009, 0x00000128, 0x00000007, 0x0004003b, 0x00000009,
++    0x00000129, 0x00000007, 0x0004003b, 0x00000007, 0x0000012a, 0x00000007, 0x0004003b, 0x00000009,
++    0x0000012d, 0x00000007, 0x0004003b, 0x00000009, 0x0000012e, 0x00000007, 0x0004003b, 0x00000009,
++    0x00000132, 0x00000007, 0x0004003b, 0x00000009, 0x00000133, 0x00000007, 0x0004003b, 0x00000007,
++    0x00000135, 0x00000007, 0x0004003b, 0x00000009, 0x00000138, 0x00000007, 0x0004003b, 0x00000009,
++    0x0000013b, 0x00000007, 0x0004003b, 0x00000009, 0x0000013c, 0x00000007, 0x0004003b, 0x00000007,
++    0x0000013e, 0x00000007, 0x0004003b, 0x00000009, 0x00000141, 0x00000007, 0x0004003b, 0x00000009,
++    0x00000144, 0x00000007, 0x0004003b, 0x00000009, 0x00000145, 0x00000007, 0x0004003b, 0x00000007,
++    0x00000147, 0x00000007, 0x0004003b, 0x00000009, 0x0000014a, 0x00000007, 0x0004003b, 0x00000009,
++    0x0000014d, 0x00000007, 0x0004003b, 0x00000167, 0x00000168, 0x00000007, 0x0004003b, 0x00000009,
++    0x0000016d, 0x00000007, 0x0004003b, 0x00000009, 0x00000171, 0x00000007, 0x0004003d, 0x000000c2,
++    0x000000c6, 0x000000c4, 0x0007004f, 0x000000c5, 0x000000c7, 0x000000c6, 0x000000c6, 0x00000000,
++    0x00000001, 0x0004007c, 0x000000bf, 0x000000c8, 0x000000c7, 0x0003003e, 0x000000c1, 0x000000c8,
++    0x0004003d, 0x000000ca, 0x000000cd, 0x000000cc, 0x00040068, 0x000000bf, 0x000000ce, 0x000000cd,
++    0x0003003e, 0x000000c9, 0x000000ce, 0x00050041, 0x000000d0, 0x000000d1, 0x000000c1, 0x00000071,
++    0x0004003d, 0x00000024, 0x000000d2, 0x000000d1, 0x00050041, 0x000000d0, 0x000000d3, 0x000000c9,
++    0x00000071, 0x0004003d, 0x00000024, 0x000000d4, 0x000000d3, 0x000500af, 0x000000cf, 0x000000d5,
++    0x000000d2, 0x000000d4, 0x000400a8, 0x000000cf, 0x000000d6, 0x000000d5, 0x000300f7, 0x000000d8,
++    0x00000000, 0x000400fa, 0x000000d6, 0x000000d7, 0x000000d8, 0x000200f8, 0x000000d7, 0x00050041,
++    0x000000d0, 0x000000d9, 0x000000c1, 0x00000079, 0x0004003d, 0x00000024, 0x000000da, 0x000000d9,
++    0x00050041, 0x000000d0, 0x000000db, 0x000000c9, 0x00000079, 0x0004003d, 0x00000024, 0x000000dc,
++    0x000000db, 0x000500af, 0x000000cf, 0x000000dd, 0x000000da, 0x000000dc, 0x000200f9, 0x000000d8,
++    0x000200f8, 0x000000d8, 0x000700f5, 0x000000cf, 0x000000de, 0x000000d5, 0x00000005, 0x000000dd,
++    0x000000d7, 0x000300f7, 0x000000e0, 0x00000000, 0x000400fa, 0x000000de, 0x000000df, 0x000000e0,
++    0x000200f8, 0x000000df, 0x000100fd, 0x000200f8, 0x000000e0, 0x0004003d, 0x00000089, 0x000000e4,
++    0x0000008b, 0x00040064, 0x00000088, 0x000000e6, 0x000000e4, 0x00050067, 0x000000bf, 0x000000e7,
++    0x000000e6, 0x000000e5, 0x0004006f, 0x00000020, 0x000000e8, 0x000000e7, 0x0003003e, 0x000000e3,
++    0x000000e8, 0x0004003d, 0x000000bf, 0x000000ea, 0x000000c1, 0x0004006f, 0x00000020, 0x000000eb,
++    0x000000ea, 0x00050041, 0x000000ec, 0x000000ed, 0x00000023, 0x000000e5, 0x0004003d, 0x00000020,
++    0x000000ee, 0x000000ed, 0x00050083, 0x00000020, 0x000000ef, 0x000000eb, 0x000000ee, 0x0003003e,
++    0x000000e9, 0x000000ef, 0x0004003d, 0x00000020, 0x000000f1, 0x000000e9, 0x00050050, 0x00000020,
++    0x000000f2, 0x00000019, 0x00000019, 0x00050081, 0x00000020, 0x000000f3, 0x000000f1, 0x000000f2,
++    0x00050041, 0x000000ec, 0x000000f5, 0x00000023, 0x000000f4, 0x0004003d, 0x00000020, 0x000000f6,
++    0x000000f5, 0x00050085, 0x00000020, 0x000000f7, 0x000000f3, 0x000000f6, 0x0003003e, 0x000000f0,
++    0x000000f7, 0x00050041, 0x00000007, 0x000000f8, 0x000000e9, 0x00000071, 0x0004003d, 0x00000006,
++    0x000000f9, 0x000000f8, 0x000500b8, 0x000000cf, 0x000000fa, 0x000000f9, 0x00000091, 0x000400a8,
++    0x000000cf, 0x000000fb, 0x000000fa, 0x000300f7, 0x000000fd, 0x00000000, 0x000400fa, 0x000000fb,
++    0x000000fc, 0x000000fd, 0x000200f8, 0x000000fc, 0x00050041, 0x00000007, 0x000000fe, 0x000000e9,
++    0x00000079, 0x0004003d, 0x00000006, 0x000000ff, 0x000000fe, 0x000500b8, 0x000000cf, 0x00000100,
++    0x000000ff, 0x00000091, 0x000200f9, 0x000000fd, 0x000200f8, 0x000000fd, 0x000700f5, 0x000000cf,
++    0x00000101, 0x000000fa, 0x000000e0, 0x00000100, 0x000000fc, 0x000400a8, 0x000000cf, 0x00000102,
++    0x00000101, 0x000300f7, 0x00000104, 0x00000000, 0x000400fa, 0x00000102, 0x00000103, 0x00000104,
++    0x000200f8, 0x00000103, 0x00050041, 0x00000007, 0x00000105, 0x000000f0, 0x00000071, 0x0004003d,
++    0x00000006, 0x00000106, 0x00000105, 0x00050041, 0x00000007, 0x00000107, 0x000000e3, 0x00000071,
++    0x0004003d, 0x00000006, 0x00000108, 0x00000107, 0x000500ba, 0x000000cf, 0x00000109, 0x00000106,
++    0x00000108, 0x000200f9, 0x00000104, 0x000200f8, 0x00000104, 0x000700f5, 0x000000cf, 0x0000010a,
++    0x00000101, 0x000000fd, 0x00000109, 0x00000103, 0x000400a8, 0x000000cf, 0x0000010b, 0x0000010a,
++    0x000300f7, 0x0000010d, 0x00000000, 0x000400fa, 0x0000010b, 0x0000010c, 0x0000010d, 0x000200f8,
++    0x0000010c, 0x00050041, 0x00000007, 0x0000010e, 0x000000f0, 0x00000079, 0x0004003d, 0x00000006,
++    0x0000010f, 0x0000010e, 0x00050041, 0x00000007, 0x00000110, 0x000000e3, 0x00000079, 0x0004003d,
++    0x00000006, 0x00000111, 0x00000110, 0x000500ba, 0x000000cf, 0x00000112, 0x0000010f, 0x00000111,
++    0x000200f9, 0x0000010d, 0x000200f8, 0x0000010d, 0x000700f5, 0x000000cf, 0x00000113, 0x0000010a,
++    0x00000104, 0x00000112, 0x0000010c, 0x000300f7, 0x00000115, 0x00000000, 0x000400fa, 0x00000113,
++    0x00000114, 0x00000115, 0x000200f8, 0x00000114, 0x0004003d, 0x000000ca, 0x00000116, 0x000000cc,
++    0x0004003d, 0x000000bf, 0x00000117, 0x000000c1, 0x00040063, 0x00000116, 0x00000117, 0x00000118,
++    0x000100fd, 0x000200f8, 0x00000115, 0x0004003d, 0x00000020, 0x0000011b, 0x000000f0, 0x00050050,
++    0x00000020, 0x0000011c, 0x0000011a, 0x0000011a, 0x00050081, 0x00000020, 0x0000011d, 0x0000011b,
++    0x0000011c, 0x0003003e, 0x000000f0, 0x0000011d, 0x00050041, 0x00000007, 0x00000121, 0x000000f0,
++    0x00000071, 0x0004003d, 0x00000006, 0x00000122, 0x00000121, 0x0003003e, 0x00000120, 0x00000122,
++    0x00070039, 0x00000002, 0x00000125, 0x0000000e, 0x00000120, 0x00000123, 0x00000124, 0x0004003d,
++    0x00000008, 0x00000126, 0x00000123, 0x0003003e, 0x0000011e, 0x00000126, 0x0004003d, 0x00000008,
++    0x00000127, 0x00000124, 0x0003003e, 0x0000011f, 0x00000127, 0x00050041, 0x00000007, 0x0000012b,
++    0x000000f0, 0x00000079, 0x0004003d, 0x00000006, 0x0000012c, 0x0000012b, 0x0003003e, 0x0000012a,
++    0x0000012c, 0x00070039, 0x00000002, 0x0000012f, 0x0000000e, 0x0000012a, 0x0000012d, 0x0000012e,
++    0x0004003d, 0x00000008, 0x00000130, 0x0000012d, 0x0003003e, 0x00000128, 0x00000130, 0x0004003d,
++    0x00000008, 0x00000131, 0x0000012e, 0x0003003e, 0x00000129, 0x00000131, 0x0004003d, 0x00000008,
++    0x00000134, 0x0000011e, 0x0003003e, 0x00000133, 0x00000134, 0x00050041, 0x00000007, 0x00000136,
++    0x00000128, 0x00000071, 0x0004003d, 0x00000006, 0x00000137, 0x00000136, 0x0003003e, 0x00000135,
++    0x00000137, 0x0004003d, 0x00000008, 0x00000139, 0x0000011f, 0x0003003e, 0x00000138, 0x00000139,
++    0x00070039, 0x00000008, 0x0000013a, 0x00000014, 0x00000133, 0x00000135, 0x00000138, 0x0003003e,
++    0x00000132, 0x0000013a, 0x0004003d, 0x00000008, 0x0000013d, 0x0000011e, 0x0003003e, 0x0000013c,
++    0x0000013d, 0x00050041, 0x00000007, 0x0000013f, 0x00000128, 0x00000079, 0x0004003d, 0x00000006,
++    0x00000140, 0x0000013f, 0x0003003e, 0x0000013e, 0x00000140, 0x0004003d, 0x00000008, 0x00000142,
++    0x0000011f, 0x0003003e, 0x00000141, 0x00000142, 0x00070039, 0x00000008, 0x00000143, 0x00000014,
++    0x0000013c, 0x0000013e, 0x00000141, 0x0003003e, 0x0000013b, 0x00000143, 0x0004003d, 0x00000008,
++    0x00000146, 0x0000011e, 0x0003003e, 0x00000145, 0x00000146, 0x00050041, 0x00000007, 0x00000148,
++    0x00000128, 0x00000081, 0x0004003d, 0x00000006, 0x00000149, 0x00000148, 0x0003003e, 0x00000147,
++    0x00000149, 0x0004003d, 0x00000008, 0x0000014b, 0x0000011f, 0x0003003e, 0x0000014a, 0x0000014b,
++    0x00070039, 0x00000008, 0x0000014c, 0x00000014, 0x00000145, 0x00000147, 0x0000014a, 0x0003003e,
++    0x00000144, 0x0000014c, 0x0004003d, 0x00000008, 0x0000014e, 0x0000013b, 0x00050041, 0x00000007,
++    0x0000014f, 0x00000129, 0x00000079, 0x0004003d, 0x00000006, 0x00000150, 0x0000014f, 0x0005008e,
++    0x00000008, 0x00000151, 0x0000014e, 0x00000150, 0x0004003d, 0x00000008, 0x00000152, 0x00000132,
++    0x00050041, 0x00000007, 0x00000153, 0x00000129, 0x00000071, 0x0004003d, 0x00000006, 0x00000154,
++    0x00000153, 0x0005008e, 0x00000008, 0x00000155, 0x00000152, 0x00000154, 0x00050081, 0x00000008,
++    0x00000156, 0x00000151, 0x00000155, 0x0004003d, 0x00000008, 0x00000157, 0x00000144, 0x00050041,
++    0x00000007, 0x00000158, 0x00000129, 0x00000081, 0x0004003d, 0x00000006, 0x00000159, 0x00000158,
++    0x0005008e, 0x00000008, 0x0000015a, 0x00000157, 0x00000159, 0x00050081, 0x00000008, 0x0000015b,
++    0x00000156, 0x0000015a, 0x00050041, 0x00000007, 0x0000015c, 0x00000129, 0x00000079, 0x0004003d,
++    0x00000006, 0x0000015d, 0x0000015c, 0x00050041, 0x00000007, 0x0000015e, 0x00000129, 0x00000071,
++    0x0004003d, 0x00000006, 0x0000015f, 0x0000015e, 0x00050081, 0x00000006, 0x00000160, 0x0000015d,
++    0x0000015f, 0x00050041, 0x00000007, 0x00000161, 0x00000129, 0x00000081, 0x0004003d, 0x00000006,
++    0x00000162, 0x00000161, 0x00050081, 0x00000006, 0x00000163, 0x00000160, 0x00000162, 0x00060050,
++    0x00000008, 0x00000164, 0x00000163, 0x00000163, 0x00000163, 0x00050088, 0x00000008, 0x00000165,
++    0x0000015b, 0x00000164, 0x0003003e, 0x0000014d, 0x00000165, 0x0004003d, 0x00000008, 0x00000169,
++    0x0000014d, 0x000500bc, 0x00000166, 0x0000016c, 0x00000169, 0x0000016b, 0x0003003e, 0x00000168,
++    0x0000016c, 0x0004003d, 0x00000008, 0x0000016e, 0x0000014d, 0x0005008e, 0x00000008, 0x00000170,
++    0x0000016e, 0x0000016f, 0x0003003e, 0x0000016d, 0x00000170, 0x0004003d, 0x00000008, 0x00000172,
++    0x0000014d, 0x0007000c, 0x00000008, 0x00000175, 0x00000001, 0x0000001a, 0x00000172, 0x00000174,
++    0x0005008e, 0x00000008, 0x00000177, 0x00000175, 0x00000176, 0x00060050, 0x00000008, 0x00000179,
++    0x00000178, 0x00000178, 0x00000178, 0x00050083, 0x00000008, 0x0000017a, 0x00000177, 0x00000179,
++    0x0003003e, 0x00000171, 0x0000017a, 0x0004003d, 0x00000008, 0x0000017b, 0x00000171, 0x0004003d,
++    0x00000008, 0x0000017c, 0x0000016d, 0x0004003d, 0x00000166, 0x0000017d, 0x00000168, 0x000600a9,
++    0x00000008, 0x0000017e, 0x0000017d, 0x0000017c, 0x0000017b, 0x0003003e, 0x0000014d, 0x0000017e,
++    0x0004003d, 0x000000ca, 0x0000017f, 0x000000cc, 0x0004003d, 0x000000bf, 0x00000180, 0x000000c1,
++    0x0004003d, 0x00000008, 0x00000181, 0x0000014d, 0x00050051, 0x00000006, 0x00000182, 0x00000181,
++    0x00000000, 0x00050051, 0x00000006, 0x00000183, 0x00000181, 0x00000001, 0x00050051, 0x00000006,
++    0x00000184, 0x00000181, 0x00000002, 0x00070050, 0x00000092, 0x00000185, 0x00000182, 0x00000183,
++    0x00000184, 0x00000040, 0x00040063, 0x0000017f, 0x00000180, 0x00000185, 0x000100fd, 0x00010038,
++    0x00050036, 0x00000002, 0x0000000e, 0x00000000, 0x0000000a, 0x00030037, 0x00000007, 0x0000000b,
++    0x00030037, 0x00000009, 0x0000000c, 0x00030037, 0x00000009, 0x0000000d, 0x000200f8, 0x0000000f,
++    0x0004003b, 0x00000007, 0x00000016, 0x00000007, 0x0004003b, 0x00000007, 0x0000001b, 0x00000007,
++    0x0004003b, 0x00000007, 0x0000001f, 0x00000007, 0x0004003b, 0x00000007, 0x00000031, 0x00000007,
++    0x0004003b, 0x00000007, 0x0000003c, 0x00000007, 0x0004003b, 0x00000007, 0x00000047, 0x00000007,
++    0x0004003b, 0x00000007, 0x0000004f, 0x00000007, 0x0004003b, 0x00000007, 0x00000059, 0x00000007,
++    0x0004003d, 0x00000006, 0x00000017, 0x0000000b, 0x0006000c, 0x00000006, 0x00000018, 0x00000001,
++    0x00000002, 0x00000017, 0x00050081, 0x00000006, 0x0000001a, 0x00000018, 0x00000019, 0x0003003e,
++    0x00000016, 0x0000001a, 0x0004003d, 0x00000006, 0x0000001c, 0x00000016, 0x0004003d, 0x00000006,
++    0x0000001d, 0x0000000b, 0x00050083, 0x00000006, 0x0000001e, 0x0000001c, 0x0000001d, 0x0003003e,
++    0x0000001b, 0x0000001e, 0x00050041, 0x00000026, 0x00000027, 0x00000023, 0x00000025, 0x0004003d,
++    0x00000006, 0x00000028, 0x00000027, 0x0004003d, 0x00000006, 0x00000029, 0x0000001b, 0x00050083,
++    0x00000006, 0x0000002b, 0x00000029, 0x0000002a, 0x00050085, 0x00000006, 0x0000002c, 0x00000028,
++    0x0000002b, 0x0004003d, 0x00000006, 0x0000002d, 0x0000001b, 0x00050083, 0x00000006, 0x0000002e,
++    0x0000002d, 0x0000002a, 0x00050085, 0x00000006, 0x0000002f, 0x0000002c, 0x0000002e, 0x0006000c,
++    0x00000006, 0x00000030, 0x00000001, 0x0000001d, 0x0000002f, 0x0003003e, 0x0000001f, 0x00000030,
++    0x00050041, 0x00000026, 0x00000032, 0x00000023, 0x00000025, 0x0004003d, 0x00000006, 0x00000033,
++    0x00000032, 0x0004003d, 0x00000006, 0x00000034, 0x0000001b, 0x00050083, 0x00000006, 0x00000036,
++    0x00000034, 0x00000035, 0x00050085, 0x00000006, 0x00000037, 0x00000033, 0x00000036, 0x0004003d,
++    0x00000006, 0x00000038, 0x0000001b, 0x00050083, 0x00000006, 0x00000039, 0x00000038, 0x00000035,
++    0x00050085, 0x00000006, 0x0000003a, 0x00000037, 0x00000039, 0x0006000c, 0x00000006, 0x0000003b,
++    0x00000001, 0x0000001d, 0x0000003a, 0x0003003e, 0x00000031, 0x0000003b, 0x00050041, 0x00000026,
++    0x0000003d, 0x00000023, 0x00000025, 0x0004003d, 0x00000006, 0x0000003e, 0x0000003d, 0x0004003d,
++    0x00000006, 0x0000003f, 0x0000001b, 0x00050083, 0x00000006, 0x00000041, 0x0000003f, 0x00000040,
++    0x00050085, 0x00000006, 0x00000042, 0x0000003e, 0x00000041, 0x0004003d, 0x00000006, 0x00000043,
++    0x0000001b, 0x00050083, 0x00000006, 0x00000044, 0x00000043, 0x00000040, 0x00050085, 0x00000006,
++    0x00000045, 0x00000042, 0x00000044, 0x0006000c, 0x00000006, 0x00000046, 0x00000001, 0x0000001d,
++    0x00000045, 0x0003003e, 0x0000003c, 0x00000046, 0x00050041, 0x00000026, 0x00000048, 0x00000023,
++    0x00000025, 0x0004003d, 0x00000006, 0x00000049, 0x00000048, 0x0004003d, 0x00000006, 0x0000004a,
++    0x0000001b, 0x00050085, 0x00000006, 0x0000004b, 0x00000049, 0x0000004a, 0x0004003d, 0x00000006,
++    0x0000004c, 0x0000001b, 0x00050085, 0x00000006, 0x0000004d, 0x0000004b, 0x0000004c, 0x0006000c,
++    0x00000006, 0x0000004e, 0x00000001, 0x0000001d, 0x0000004d, 0x0003003e, 0x00000047, 0x0000004e,
++    0x00050041, 0x00000026, 0x00000050, 0x00000023, 0x00000025, 0x0004003d, 0x00000006, 0x00000051,
++    0x00000050, 0x0004003d, 0x00000006, 0x00000052, 0x0000001b, 0x00050081, 0x00000006, 0x00000053,
++    0x00000052, 0x00000040, 0x00050085, 0x00000006, 0x00000054, 0x00000051, 0x00000053, 0x0004003d,
++    0x00000006, 0x00000055, 0x0000001b, 0x00050081, 0x00000006, 0x00000056, 0x00000055, 0x00000040,
++    0x00050085, 0x00000006, 0x00000057, 0x00000054, 0x00000056, 0x0006000c, 0x00000006, 0x00000058,
++    0x00000001, 0x0000001d, 0x00000057, 0x0003003e, 0x0000004f, 0x00000058, 0x00050041, 0x00000026,
++    0x0000005a, 0x00000023, 0x00000025, 0x0004003d, 0x00000006, 0x0000005b, 0x0000005a, 0x0004003d,
++    0x00000006, 0x0000005c, 0x0000001b, 0x00050081, 0x00000006, 0x0000005d, 0x0000005c, 0x00000035,
++    0x00050085, 0x00000006, 0x0000005e, 0x0000005b, 0x0000005d, 0x0004003d, 0x00000006, 0x0000005f,
++    0x0000001b, 0x00050081, 0x00000006, 0x00000060, 0x0000005f, 0x00000035, 0x00050085, 0x00000006,
++    0x00000061, 0x0000005e, 0x00000060, 0x0006000c, 0x00000006, 0x00000062, 0x00000001, 0x0000001d,
++    0x00000061, 0x0003003e, 0x00000059, 0x00000062, 0x0004003d, 0x00000006, 0x00000063, 0x0000001f,
++    0x0004003d, 0x00000006, 0x00000064, 0x00000031, 0x00050081, 0x00000006, 0x00000065, 0x00000063,
++    0x00000064, 0x0004003d, 0x00000006, 0x00000066, 0x0000003c, 0x0004003d, 0x00000006, 0x00000067,
++    0x00000047, 0x00050081, 0x00000006, 0x00000068, 0x00000066, 0x00000067, 0x0004003d, 0x00000006,
++    0x00000069, 0x0000004f, 0x0004003d, 0x00000006, 0x0000006a, 0x00000059, 0x00050081, 0x00000006,
++    0x0000006b, 0x00000069, 0x0000006a, 0x00060050, 0x00000008, 0x0000006c, 0x00000065, 0x00000068,
++    0x0000006b, 0x0003003e, 0x0000000d, 0x0000006c, 0x0004003d, 0x00000006, 0x0000006d, 0x00000016,
++    0x00050083, 0x00000006, 0x0000006e, 0x0000006d, 0x0000002a, 0x0004003d, 0x00000006, 0x0000006f,
++    0x00000031, 0x00050041, 0x00000007, 0x00000072, 0x0000000d, 0x00000071, 0x0004003d, 0x00000006,
++    0x00000073, 0x00000072, 0x00050088, 0x00000006, 0x00000074, 0x0000006f, 0x00000073, 0x00050081,
++    0x00000006, 0x00000075, 0x0000006e, 0x00000074, 0x0004003d, 0x00000006, 0x00000076, 0x00000016,
++    0x00050083, 0x00000006, 0x00000077, 0x00000076, 0x00000040, 0x0004003d, 0x00000006, 0x00000078,
++    0x00000047, 0x00050041, 0x00000007, 0x0000007a, 0x0000000d, 0x00000079, 0x0004003d, 0x00000006,
++    0x0000007b, 0x0000007a, 0x00050088, 0x00000006, 0x0000007c, 0x00000078, 0x0000007b, 0x00050081,
++    0x00000006, 0x0000007d, 0x00000077, 0x0000007c, 0x0004003d, 0x00000006, 0x0000007e, 0x00000016,
++    0x00050081, 0x00000006, 0x0000007f, 0x0000007e, 0x00000040, 0x0004003d, 0x00000006, 0x00000080,
++    0x00000059, 0x00050041, 0x00000007, 0x00000082, 0x0000000d, 0x00000081, 0x0004003d, 0x00000006,
++    0x00000083, 0x00000082, 0x00050088, 0x00000006, 0x00000084, 0x00000080, 0x00000083, 0x00050081,
++    0x00000006, 0x00000085, 0x0000007f, 0x00000084, 0x00060050, 0x00000008, 0x00000086, 0x00000075,
++    0x0000007d, 0x00000085, 0x0003003e, 0x0000000c, 0x00000086, 0x000100fd, 0x00010038, 0x00050036,
++    0x00000008, 0x00000014, 0x00000000, 0x00000010, 0x00030037, 0x00000009, 0x00000011, 0x00030037,
++    0x00000007, 0x00000012, 0x00030037, 0x00000009, 0x00000013, 0x000200f8, 0x00000015, 0x0004003b,
++    0x00000009, 0x00000087, 0x00000007, 0x0004003b, 0x00000009, 0x00000095, 0x00000007, 0x0004003b,
++    0x00000009, 0x0000009d, 0x00000007, 0x0004003d, 0x00000089, 0x0000008c, 0x0000008b, 0x00050041,
++    0x00000007, 0x0000008d, 0x00000011, 0x00000079, 0x0004003d, 0x00000006, 0x0000008e, 0x0000008d,
++    0x0004003d, 0x00000006, 0x0000008f, 0x00000012, 0x00050050, 0x00000020, 0x00000090, 0x0000008e,
++    0x0000008f, 0x00070058, 0x00000092, 0x00000093, 0x0000008c, 0x00000090, 0x00000002, 0x00000091,
++    0x0008004f, 0x00000008, 0x00000094, 0x00000093, 0x00000093, 0x00000000, 0x00000001, 0x00000002,
++    0x0003003e, 0x00000087, 0x00000094, 0x0004003d, 0x00000089, 0x00000096, 0x0000008b, 0x00050041,
++    0x00000007, 0x00000097, 0x00000011, 0x00000071, 0x0004003d, 0x00000006, 0x00000098, 0x00000097,
++    0x0004003d, 0x00000006, 0x00000099, 0x00000012, 0x00050050, 0x00000020, 0x0000009a, 0x00000098,
++    0x00000099, 0x00070058, 0x00000092, 0x0000009b, 0x00000096, 0x0000009a, 0x00000002, 0x00000091,
++    0x0008004f, 0x00000008, 0x0000009c, 0x0000009b, 0x0000009b, 0x00000000, 0x00000001, 0x00000002,
++    0x0003003e, 0x00000095, 0x0000009c, 0x0004003d, 0x00000089, 0x0000009e, 0x0000008b, 0x00050041,
++    0x00000007, 0x0000009f, 0x00000011, 0x00000081, 0x0004003d, 0x00000006, 0x000000a0, 0x0000009f,
++    0x0004003d, 0x00000006, 0x000000a1, 0x00000012, 0x00050050, 0x00000020, 0x000000a2, 0x000000a0,
++    0x000000a1, 0x00070058, 0x00000092, 0x000000a3, 0x0000009e, 0x000000a2, 0x00000002, 0x00000091,
++    0x0008004f, 0x00000008, 0x000000a4, 0x000000a3, 0x000000a3, 0x00000000, 0x00000001, 0x00000002,
++    0x0003003e, 0x0000009d, 0x000000a4, 0x0004003d, 0x00000008, 0x000000a5, 0x00000087, 0x00050041,
++    0x00000007, 0x000000a6, 0x00000013, 0x00000079, 0x0004003d, 0x00000006, 0x000000a7, 0x000000a6,
++    0x0005008e, 0x00000008, 0x000000a8, 0x000000a5, 0x000000a7, 0x0004003d, 0x00000008, 0x000000a9,
++    0x00000095, 0x00050041, 0x00000007, 0x000000aa, 0x00000013, 0x00000071, 0x0004003d, 0x00000006,
++    0x000000ab, 0x000000aa, 0x0005008e, 0x00000008, 0x000000ac, 0x000000a9, 0x000000ab, 0x00050081,
++    0x00000008, 0x000000ad, 0x000000a8, 0x000000ac, 0x0004003d, 0x00000008, 0x000000ae, 0x0000009d,
++    0x00050041, 0x00000007, 0x000000af, 0x00000013, 0x00000081, 0x0004003d, 0x00000006, 0x000000b0,
++    0x000000af, 0x0005008e, 0x00000008, 0x000000b1, 0x000000ae, 0x000000b0, 0x00050081, 0x00000008,
++    0x000000b2, 0x000000ad, 0x000000b1, 0x00050041, 0x00000007, 0x000000b3, 0x00000013, 0x00000079,
++    0x0004003d, 0x00000006, 0x000000b4, 0x000000b3, 0x00050041, 0x00000007, 0x000000b5, 0x00000013,
++    0x00000071, 0x0004003d, 0x00000006, 0x000000b6, 0x000000b5, 0x00050081, 0x00000006, 0x000000b7,
++    0x000000b4, 0x000000b6, 0x00050041, 0x00000007, 0x000000b8, 0x00000013, 0x00000081, 0x0004003d,
++    0x00000006, 0x000000b9, 0x000000b8, 0x00050081, 0x00000006, 0x000000ba, 0x000000b7, 0x000000b9,
++    0x00060050, 0x00000008, 0x000000bb, 0x000000ba, 0x000000ba, 0x000000ba, 0x00050088, 0x00000008,
++    0x000000bc, 0x000000b2, 0x000000bb, 0x000200fe, 0x000000bc, 0x00010038,
 +};
 +
  static VkResult create_descriptor_set( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
  {
      VkDescriptorImageInfo userDescriptorImageInfo = {0}, realDescriptorImageInfo = {0};
-@@ -3197,7 +3361,10 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
+@@ -3106,6 +3658,213 @@ static BOOL fs_hack_format_supports( struct vulkan_physical_device *physical_dev
+     return (props.optimalTilingFeatures & features) == features;
+ }
+ 
++static BOOL fs_hack_dldsr_model( VkExtent2D source, VkExtent2D target, UINT *model )
++{
++    static const UINT scales[] = {13333, 15000};
++    UINT i;
++
++    for (i = 0; i < ARRAY_SIZE(scales); i++)
++        if (source.width == (UINT)floor( target.width * (scales[i] / 10000.0) + 0.5 ) &&
++            source.height == (UINT)floor( target.height * (scales[i] / 10000.0) + 0.5 ))
++        {
++            *model = i;
++            return TRUE;
++        }
++    return FALSE;
++}
++
++/* The extractor authenticates the driver payloads before adapting their
++ * texture-handle ABI. A zero requested size accepts a bounded cubin; weights
++ * have an exact size shared by every architecture. */
++static void *fs_hack_dldsr_read( const char *directory, const char *name, size_t *size )
++{
++    size_t path_size = strlen( directory ) + strlen( name ) + 2, done = 0;
++    unsigned char *data = NULL;
++    struct stat st;
++    char *path;
++    ssize_t n;
++    int fd;
++
++    if (!(path = malloc( path_size ))) return NULL;
++    snprintf( path, path_size, "%s/%s", directory, name );
++    fd = open( path, O_RDONLY | O_CLOEXEC | O_NONBLOCK );
++    free( path );
++    if (fd < 0) return NULL;
++    if (fstat( fd, &st ) || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > 1024 * 1024 ||
++        (*size && st.st_size != *size) || !(data = malloc( st.st_size ))) goto done;
++    *size = st.st_size;
++    while (done < *size)
++    {
++        n = read( fd, data + done, *size - done );
++        if (n < 0 && errno == EINTR) continue;
++        if (n <= 0)
++        {
++            free( data );
++            data = NULL;
++            break;
++        }
++        done += n;
++    }
++done:
++    close( fd );
++    return data;
++}
++
++static void destroy_dldsr_state( struct vulkan_device *device, struct swapchain *swapchain )
++{
++    struct fs_hack_dldsr *dl = &swapchain->dldsr;
++
++    if (dl->function) device->p_vkDestroyCuFunctionNVX( device->host.device, dl->function, NULL );
++    if (dl->module) device->p_vkDestroyCuModuleNVX( device->host.device, dl->module, NULL );
++    if (dl->weights) device->p_vkDestroyBuffer( device->host.device, dl->weights, NULL );
++    if (dl->memory) device->p_vkFreeMemory( device->host.device, dl->memory, NULL );
++    if (dl->layout) device->p_vkDestroyPipelineLayout( device->host.device, dl->layout, NULL );
++    if (dl->sampler) device->p_vkDestroySampler( device->host.device, dl->sampler, NULL );
++    memset( dl, 0, sizeof(*dl) );
++}
++
++static VkResult init_dldsr_state( struct vulkan_device *device, struct swapchain *swapchain )
++{
++    struct vulkan_physical_device *physical_device = device->physical_device;
++    struct fs_hack_dldsr *dl = &swapchain->dldsr;
++    const char *directory = getenv( "WINE_DLDSR_PATH" );
++    size_t cubin_size = 0, weights_size = dl->model ? 20032 : 10784;
++    char cubin_name[40];
++    uint32_t elf_flags;
++    VkCuModuleTexturingModeCreateInfoNVX texturing = {VK_STRUCTURE_TYPE_CU_MODULE_TEXTURING_MODE_CREATE_INFO_NVX};
++    VkCuModuleCreateInfoNVX module_info = {VK_STRUCTURE_TYPE_CU_MODULE_CREATE_INFO_NVX, &texturing};
++    VkCuFunctionCreateInfoNVX function_info = {VK_STRUCTURE_TYPE_CU_FUNCTION_CREATE_INFO_NVX};
++    VkBufferCreateInfo buffer_info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++    VkMemoryAllocateFlagsInfo flags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
++    VkMemoryAllocateInfo alloc_info = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
++    VkBufferDeviceAddressInfo address_info = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
++    VkSamplerCreateInfo sampler_info = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
++    VkPipelineLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++    VkImageViewCreateInfo view_info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++    VkImageViewHandleInfoNVX handle_info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX};
++    const VkMemoryPropertyFlags memory_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    PFN_vkGetBufferDeviceAddress get_address = device->p_vkGetBufferDeviceAddressKHR;
++    VkPhysicalDeviceMemoryProperties properties;
++    VkMemoryRequirements requirements;
++    void *cubin = NULL, *weights = NULL, *mapped;
++    uint64_t texture;
++    uint32_t i;
++    VkResult res = VK_ERROR_INITIALIZATION_FAILED;
++
++    if (!directory || !*directory || !device->dldsr_enabled ||
++        !device->p_vkCreateCuModuleNVX || !device->p_vkDestroyCuModuleNVX ||
++        !device->p_vkCreateCuFunctionNVX || !device->p_vkDestroyCuFunctionNVX ||
++        !device->p_vkCmdCuLaunchKernelNVX || !device->p_vkGetImageViewHandle64NVX ||
++        !device->p_vkGetImageViewHandleNVX) goto fail;
++    if (!get_address) get_address = device->p_vkGetBufferDeviceAddress;
++    if (!get_address) goto fail;
++
++    snprintf( cubin_name, sizeof(cubin_name), "sm%u/prog%02u-vk.cubin", device->dldsr_sm, dl->model );
++    cubin = fs_hack_dldsr_read( directory, cubin_name, &cubin_size );
++    weights = fs_hack_dldsr_read( directory, dl->model ? "weights01.bin" : "weights00.bin", &weights_size );
++    if (!cubin || !weights || cubin_size < 64) goto fail;
++    /* ELF64 little-endian CUDA ABI 7. Reject wrappers for another target
++     * before passing their metadata to the host binary importer. */
++    memcpy( &elf_flags, (char *)cubin + 48, sizeof(elf_flags) );
++    if (memcmp( cubin, "\177ELF\002\001\001\063\007", 9 ) ||
++        memcmp( (char *)cubin + 16, "\002\000\276\000", 4 ) ||
++        elf_flags != ((device->dldsr_sm << 16) | 0x0500 | device->dldsr_sm)) goto fail;
++
++    texturing.use64bitTexturing = device->dldsr_sm >= 120;
++    module_info.dataSize = cubin_size;
++    module_info.pData = cubin;
++    if ((res = device->p_vkCreateCuModuleNVX( device->host.device, &module_info, NULL, &dl->module ))) goto fail;
++    function_info.module = dl->module;
++    function_info.pName = "dldsr";
++    if ((res = device->p_vkCreateCuFunctionNVX( device->host.device, &function_info, NULL, &dl->function ))) goto fail;
++
++    buffer_info.size = weights_size;
++    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++    if ((res = device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &dl->weights ))) goto fail;
++    device->p_vkGetBufferMemoryRequirements( device->host.device, dl->weights, &requirements );
++    physical_device->instance->p_vkGetPhysicalDeviceMemoryProperties( physical_device->host.physical_device, &properties );
++    for (i = 0; i < properties.memoryTypeCount; i++)
++        if ((requirements.memoryTypeBits & (1u << i)) &&
++            (properties.memoryTypes[i].propertyFlags & memory_flags) == memory_flags) break;
++    if (i == properties.memoryTypeCount)
++    {
++        res = VK_ERROR_FEATURE_NOT_PRESENT;
++        goto fail;
++    }
++    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
++    alloc_info.allocationSize = requirements.size;
++    alloc_info.memoryTypeIndex = i;
++    if ((res = device->p_vkAllocateMemory( device->host.device, &alloc_info, NULL, &dl->memory ))) goto fail;
++    if ((res = device->p_vkBindBufferMemory( device->host.device, dl->weights, dl->memory, 0 ))) goto fail;
++    if ((res = device->p_vkMapMemory( device->host.device, dl->memory, 0, weights_size, 0, &mapped ))) goto fail;
++    memcpy( mapped, weights, weights_size );
++    device->p_vkUnmapMemory( device->host.device, dl->memory );
++    address_info.buffer = dl->weights;
++    if (!(dl->address = get_address( device->host.device, &address_info )))
++    {
++        res = VK_ERROR_INITIALIZATION_FAILED;
++        goto fail;
++    }
++
++    sampler_info.magFilter = sampler_info.minFilter = VK_FILTER_LINEAR;
++    sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    sampler_info.addressModeU = sampler_info.addressModeV = sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    if ((res = device->p_vkCreateSampler( device->host.device, &sampler_info, NULL, &dl->sampler ))) goto fail;
++    if ((res = device->p_vkCreatePipelineLayout( device->host.device, &layout_info, NULL, &dl->layout ))) goto fail;
++
++    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    view_info.subresourceRange.levelCount = view_info.subresourceRange.layerCount = 1;
++    for (i = 0; i < swapchain->n_images; i++)
++    {
++        struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
++
++        /* The native network samples encoded RGB. Keep the ordinary sRGB
++         * view alive so setup failure can fall back to linear-light DSR. */
++        view_info.image = hack->user_image;
++        view_info.format = dl->source_format;
++        if ((res = device->p_vkCreateImageView( device->host.device, &view_info, NULL, &hack->dldsr_view ))) goto fail;
++        view_info.image = hack->swapchain_image;
++        view_info.format = VK_FORMAT_B8G8R8A8_UNORM;
++        if ((res = device->p_vkCreateImageView( device->host.device, &view_info, NULL, &hack->swapchain_view ))) goto fail;
++
++        handle_info.imageView = hack->dldsr_view;
++        handle_info.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++        handle_info.sampler = dl->sampler;
++        texture = texturing.use64bitTexturing ?
++                  device->p_vkGetImageViewHandle64NVX( device->host.device, &handle_info ) :
++                  device->p_vkGetImageViewHandleNVX( device->host.device, &handle_info );
++        hack->dldsr_texture = (uint32_t)texture;
++        hack->dldsr_sampler = (uint32_t)(texture >> 32);
++        handle_info.imageView = hack->swapchain_view;
++        handle_info.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++        handle_info.sampler = VK_NULL_HANDLE;
++        hack->dldsr_surface = device->p_vkGetImageViewHandleNVX( device->host.device, &handle_info );
++    }
++
++    free( cubin );
++    free( weights );
++    WARN( "Enabled DL-DSR %s, %ux%u -> %ux%u, smoothness %.0f%%\n", dl->model ? "2.25x" : "1.78x",
++          swapchain->extents.width, swapchain->extents.height, swapchain->host_extents.width,
++          swapchain->host_extents.height, fs_hack_dsr_smoothness() * 100.0f );
++    return VK_SUCCESS;
++
++fail:
++    free( cubin );
++    free( weights );
++    for (i = 0; i < swapchain->n_images; i++)
++    {
++        struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
++        device->p_vkDestroyImageView( device->host.device, hack->dldsr_view, NULL );
++        device->p_vkDestroyImageView( device->host.device, hack->swapchain_view, NULL );
++        hack->dldsr_view = hack->swapchain_view = VK_NULL_HANDLE;
++    }
++    destroy_dldsr_state( device, swapchain );
++    swapchain->upscaler.is_dldsr = FALSE;
++    WARN( "DL-DSR setup returned %d, using the DSR filter\n", res );
++    return res;
++}
++
+ static VkResult init_compute_state( struct vulkan_device *device, struct swapchain *swapchain )
+ {
+     VkResult res;
+@@ -3123,6 +3882,12 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
+     uint32_t i;
+     uint32_t fsr_memory_type = -1;
+ 
++    if (swapchain->upscaler.is_dldsr)
++    {
++        res = init_dldsr_state( device, swapchain );
++        if (res == VK_SUCCESS || res == VK_ERROR_DEVICE_LOST) return res;
++    }
++
+     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+     samplerInfo.magFilter = samplerInfo.minFilter =
+         (swapchain->upscaler.is_fsr ||
+@@ -3137,10 +3902,11 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
+     samplerInfo.anisotropyEnable = VK_FALSE;
+     samplerInfo.maxAnisotropy = 1;
+     samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+-    samplerInfo.unnormalizedCoordinates = VK_FALSE;
++    /* The DSR filter takes coordinates in source pixels, as NVIDIA's program does */
++    samplerInfo.unnormalizedCoordinates = swapchain->upscaler.is_dsr ? VK_TRUE : VK_FALSE;
+     samplerInfo.compareEnable = VK_FALSE;
+     samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
++    samplerInfo.mipmapMode = swapchain->upscaler.is_dsr ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+     samplerInfo.mipLodBias = 0.0f;
+     samplerInfo.minLod = 0.0f;
+     samplerInfo.maxLod = 0.0f;
+@@ -3197,7 +3963,10 @@ static VkResult init_compute_state( struct vulkan_device *device, struct swapcha
          goto fail;
      }
  
 -    if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
-+    if (swapchain->upscaler.is_box)
-+        res = create_pipeline( device, swapchain, box_comp_spv, sizeof(box_comp_spv),
-+                               4 * sizeof(uint32_t), &swapchain->blit_pipeline );
++    if (swapchain->upscaler.is_dsr)
++        res = create_pipeline( device, swapchain, dsr_comp_spv, sizeof(dsr_comp_spv),
++                               5 * sizeof(float), &swapchain->blit_pipeline );
 +    else if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
          res = create_pipeline( device, swapchain, blit_comp_spv, sizeof(blit_comp_spv),
                                 4 * sizeof(float), &swapchain->blit_pipeline );
      else
-@@ -3409,7 +3576,7 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+@@ -3396,6 +4165,7 @@ fail:
+ static void destroy_fs_hack_image( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
  {
-     struct vulkan_physical_device *physical_device = device->physical_device;
-     struct vulkan_instance *instance = physical_device->instance;
--    VkFormat user_view_format = swapchain->upscaler.is_fsr ||
-+    VkFormat user_view_format = swapchain->upscaler.is_fsr || swapchain->upscaler.is_box ||
-                                 swapchain->upscaler.color_mode != FS_HACK_COLOR_SRGB
-                                 ? srgb_to_unorm( createinfo->imageFormat )
-                                 : unorm_to_srgb( createinfo->imageFormat );
-@@ -3710,8 +3877,20 @@ static BOOL surface_get_fshack_config( struct surface *surface, const VkExtent2D
+     device->p_vkDestroyImageView( device->host.device, hack->user_view, NULL );
++    device->p_vkDestroyImageView( device->host.device, hack->dldsr_view, NULL );
+     device->p_vkDestroyImageView(device->host.device, hack->swapchain_view, NULL);
+     device->p_vkDestroyImageView(device->host.device, hack->fsr_view, NULL);
+     device->p_vkDestroyImage( device->host.device, hack->user_image, NULL );
+@@ -3430,10 +4200,15 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+         return res;
+     }
+ 
++    if (!count) return VK_ERROR_INITIALIZATION_FAILED;
+     real_images = malloc( count * sizeof(VkImage) );
+     swapchain->cmd_pools = calloc( device->queue_count, sizeof(VkCommandPool) );
+     swapchain->fs_hack_images = calloc( count, sizeof(struct fs_hack_image) );
+-    if (!real_images || !swapchain->cmd_pools || !swapchain->fs_hack_images) goto fail;
++    if (!real_images || !swapchain->cmd_pools || !swapchain->fs_hack_images)
++    {
++        res = VK_ERROR_OUT_OF_HOST_MEMORY;
++        goto fail;
++    }
+ 
+     if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &count, real_images )))
+     {
+@@ -3447,6 +4222,9 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+         struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
+ 
+         hack->swapchain_image = real_images[i];
++        /* The swapchain owns partial images, including a semaphore allocated
++         * before image creation fails. Its destructor performs all cleanup. */
++        swapchain->n_images = i + 1;
+ 
+         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+         if ((res = device->p_vkCreateSemaphore( device->host.device, &semaphoreInfo, NULL, &hack->blit_finished )))
+@@ -3473,7 +4251,7 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+ 
+         if (createinfo->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
+             imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+-        if (user_view_format != createinfo->imageFormat)
++        if (user_view_format != createinfo->imageFormat || swapchain->upscaler.is_dldsr)
+             imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+ 
+         if ((res = device->p_vkCreateImage( device->host.device, &imageInfo, NULL, &hack->user_image )))
+@@ -3488,8 +4266,6 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+         if (offs) userMemTotal += userMemReq.alignment - offs;
+ 
+         userMemTotal += userMemReq.size;
+-
+-        swapchain->n_images++;
+     }
+ 
+     /* allocate backing memory */
+@@ -3566,10 +4342,8 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
+     return VK_SUCCESS;
+ 
+ fail:
+-    for (i = 0; i < swapchain->n_images; ++i) destroy_fs_hack_image( device, swapchain, &swapchain->fs_hack_images[i] );
++    /* win32u_vkCreateSwapchainKHR destroys the partially initialized swapchain. */
+     free( real_images );
+-    free( swapchain->cmd_pools );
+-    free( swapchain->fs_hack_images );
+     return res;
+ }
+ 
+@@ -3710,8 +4484,20 @@ static BOOL surface_get_fshack_config( struct surface *surface, const VkExtent2D
      return TRUE;
  }
  
@@ -467,14 +1206,14 @@ index 2c89ae31dbc..1d139eee629 100644
  static BOOL surface_is_presentation_scaled( struct surface *surface )
  {
 +    /* With a desktop above the monitor (DSR modes) the window's pixels outnumber the monitor's;
-+     * the swapchain reduces them itself so every machine presents the same block means. */
++     * the swapchain reduces them itself, so every compositor presents the same picture. */
 +    if (dpi_value( NtUserGetDpiForWindow( surface->hwnd ) ) >
 +        dpi_value( NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI ) ) + 0.5)
 +        return FALSE;
      return surface->client->funcs->is_presentation_scaled &&
             surface->client->funcs->is_presentation_scaled( surface->client );
  }
-@@ -5591,6 +5770,24 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+@@ -5591,6 +6377,37 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
              WARN( "FSR cannot compose an offset fullscreen destination, using the blit scaler\n" );
              swapchain->upscaler.is_fsr = FALSE;
          }
@@ -483,37 +1222,178 @@ index 2c89ae31dbc..1d139eee629 100644
 +            const UINT dst_h = swapchain->fshack.dst.bottom - swapchain->fshack.dst.top;
 +            const UINT src_w = create_info->imageExtent.width, src_h = create_info->imageExtent.height;
 +
-+            /* A desktop above the monitor (DSR modes) reduces by whole factors to exact block means */
++            /* A desktop above the monitor (DSR modes) uses NVIDIA's DSR filter */
 +            if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB && dst_w && dst_h &&
-+                src_w > dst_w && src_h > dst_h && !(src_w % dst_w) && !(src_h % dst_h))
++                src_w > dst_w && src_h > dst_h)
 +            {
-+                swapchain->upscaler.is_box = TRUE;
-+                swapchain->upscaler.box_x = src_w / dst_w;
-+                swapchain->upscaler.box_y = src_h / dst_h;
++                float scale, scale_y;
++
++                dsr_axis( src_w, dst_w, &scale, &swapchain->upscaler.dsr_ratio[0] );
++                dsr_axis( src_h, dst_h, &scale_y, &swapchain->upscaler.dsr_ratio[1] );
++                swapchain->upscaler.is_dsr = TRUE;
++                swapchain->upscaler.dsr_k = dsr_coefficient( scale, fs_hack_dsr_smoothness() );
 +                swapchain->upscaler.is_fsr = FALSE;
-+                swapchain->upscaler.linear_filter = FALSE;
-+                TRACE( "Reducing %ux%u to %ux%u with %ux%u block means\n", src_w, src_h, dst_w, dst_h,
-+                       swapchain->upscaler.box_x, swapchain->upscaler.box_y );
++                swapchain->upscaler.linear_filter = TRUE;
++                TRACE( "Reducing %ux%u to %ux%u with the DSR filter, scale %.4f, coefficient %.8e\n", src_w, src_h,
++                       dst_w, dst_h, scale, swapchain->upscaler.dsr_k );
++
++                source_view_format = srgb_to_unorm( create_info->imageFormat );
++                if (device->dldsr_enabled && full_host && create_info->imageArrayLayers == 1 &&
++                    !(create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR) &&
++                    (source_view_format == VK_FORMAT_R8G8B8A8_UNORM || source_view_format == VK_FORMAT_B8G8R8A8_UNORM) &&
++                    fs_hack_dldsr_model( create_info->imageExtent, swapchain->host_extents, &swapchain->dldsr.model ))
++                {
++                    swapchain->upscaler.is_dldsr = TRUE;
++                    swapchain->dldsr.source_format = source_view_format;
++                }
 +            }
 +        }
          swapchain->upscaler.fsr.lite = lite;
          swapchain->upscaler.fsr.sharpness = sharpness;
          create_info_host.imageExtent = swapchain->host_extents;
-@@ -6623,7 +6820,13 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
+@@ -5860,19 +6677,20 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
+ 
+     if (swapchain->fshack.enabled && !swapchain->managed)
+     {
+-        for (uint32_t i = 0; i < swapchain->n_images; ++i)
++        for (uint32_t i = 0; swapchain->fs_hack_images && i < swapchain->n_images; ++i)
+         {
+             destroy_fs_hack_image( device, swapchain, &swapchain->fs_hack_images[i] );
+         }
+         for (uint32_t i = 0; i < device->queue_count; ++i)
+         {
+-            if (!swapchain->cmd_pools[i]) continue;
++            if (!swapchain->cmd_pools || !swapchain->cmd_pools[i]) continue;
+             device->p_vkDestroyCommandPool( device->host.device, swapchain->cmd_pools[i], NULL );
+         }
+ 
+         destroy_pipeline(device, &swapchain->blit_pipeline);
+         destroy_pipeline(device, &swapchain->fsr_easu_pipeline);
+         destroy_pipeline(device, &swapchain->fsr_rcas_pipeline);
++        destroy_dldsr_state( device, swapchain );
+         device->p_vkDestroyDescriptorSetLayout( device->host.device, swapchain->descriptor_set_layout, NULL );
+         device->p_vkDestroyDescriptorPool( device->host.device, swapchain->descriptor_pool, NULL );
+         device->p_vkDestroySampler( device->host.device, swapchain->sampler, NULL );
+@@ -6586,6 +7404,72 @@ static void init_barrier(VkImageMemoryBarrier *barrier)
+     barrier->subresourceRange.layerCount = 1;
+ }
+ 
++static VkResult record_dldsr_cmd( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
++{
++    const struct fs_hack_dldsr *dl = &swapchain->dldsr;
++    struct fs_hack_dldsr_params params = {0};
++    VkCommandBufferBeginInfo begin_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++    VkImageMemoryBarrier barriers[2] = {{0}};
++    VkCuLaunchInfoNVX launch = {VK_STRUCTURE_TYPE_CU_LAUNCH_INFO_NVX};
++    size_t param_size = sizeof(params);
++    /* CUDA's packed-parameter-buffer ABI, consumed synchronously while recording. */
++    const void *extras[] = {(void *)1, &params, (void *)2, &param_size, NULL};
++    const UINT tile_width = dl->model ? 48 : 32;
++    float smoothness = fs_hack_dsr_smoothness() * 100.0f;
++    VkResult res;
++
++    begin_info.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
++    if ((res = device->p_vkBeginCommandBuffer( hack->cmd, &begin_info ))) return res;
++    init_barrier( &barriers[0] );
++    init_barrier( &barriers[1] );
++    barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
++    barriers[0].image = hack->user_image;
++    barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
++    barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
++    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
++    barriers[1].image = hack->swapchain_image;
++    barriers[1].dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
++    /* NVX kernels use the all-commands/memory scopes, including their bindless
++     * image accesses. The present submission waits on the app's semaphores. */
++    device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                   0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers );
++
++    /* Restore the driver-managed descriptor heap even on a DXVK descriptor-
++     * heap device. This dedicated primary command buffer has no application
++     * descriptor state to preserve; application command buffers bind their own. */
++    device->p_vkCmdBindDescriptorSets( hack->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dl->layout, 0, 0, NULL, 0, NULL );
++
++    params.surface = hack->dldsr_surface;
++    params.texture = hack->dldsr_texture;
++    params.inv_width = 1.0f / swapchain->extents.width;
++    params.inv_height = 1.0f / swapchain->extents.height;
++    params.sharpen = -0.0714285746f - ((100.0f - smoothness) / 100.0f) * 0.0824175850f;
++    params.weights = dl->address;
++    params.sampler = hack->dldsr_sampler;
++    /* SDR UNORM input/output: the format-0x29 flag remains zero. The typed
++     * BGRA8 surface performs the native final rounding/clamping on storage. */
++    launch.function = dl->function;
++    launch.gridDimX = (swapchain->extents.width + tile_width - 1) / tile_width;
++    launch.gridDimY = (swapchain->extents.height + 47) / 48;
++    launch.gridDimZ = 1;
++    launch.blockDimX = dl->model ? 320 : 384;
++    launch.blockDimY = launch.blockDimZ = 1;
++    launch.extraCount = ARRAY_SIZE(extras);
++    launch.pExtras = extras;
++    device->p_vkCmdCuLaunchKernelNVX( hack->cmd, &launch );
++
++    barriers[0].oldLayout = barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
++    barriers[0].newLayout = barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++    barriers[0].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
++    barriers[1].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
++    barriers[0].dstAccessMask = barriers[1].dstAccessMask = 0;
++    device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                                   0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers );
++    return device->p_vkEndCommandBuffer( hack->cmd );
++}
++
+ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
+ {
+     struct fs_hack_color_constants color_constants;
+@@ -6623,7 +7507,14 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
      device->p_vkCmdPipelineBarrier( hack->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                      0, 0, NULL, 0, NULL, 2, barriers );
  
 -    if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
-+    if (swapchain->upscaler.is_box)
++    if (swapchain->upscaler.is_dsr)
 +    {
-+        uint32_t box_constants[4] = { swapchain->fshack.dst.left, swapchain->fshack.dst.top,
-+                                      swapchain->upscaler.box_x, swapchain->upscaler.box_y };
-+        bind_pipeline(device, hack->cmd, &swapchain->blit_pipeline, hack->descriptor_set, box_constants);
++        float dsr_constants[5] = { swapchain->fshack.dst.left, swapchain->fshack.dst.top,
++                                   swapchain->upscaler.dsr_ratio[0], swapchain->upscaler.dsr_ratio[1],
++                                   swapchain->upscaler.dsr_k };
++        bind_pipeline(device, hack->cmd, &swapchain->blit_pipeline, hack->descriptor_set, dsr_constants);
 +    }
 +    else if (swapchain->upscaler.color_mode == FS_HACK_COLOR_SRGB)
      {
          constants[0] = swapchain->fshack.dst.left;
          constants[1] = swapchain->fshack.dst.top;
+@@ -7341,7 +8232,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+             replacement.cmd = VK_NULL_HANDLE;
+             replacement.cmd_queue_idx = queue_idx;
+             if ((res = create_hack_cmd( queue, swapchain, queue_idx, &replacement.cmd )) ||
+-                (res = swapchain->upscaler.is_fsr ? record_fsr_cmd( device, swapchain, &replacement ) :
++                (res = swapchain->upscaler.is_dldsr ? record_dldsr_cmd( device, swapchain, &replacement ) :
++                       swapchain->upscaler.is_fsr ? record_fsr_cmd( device, swapchain, &replacement ) :
+                                                    record_compute_cmd( device, swapchain, &replacement )))
+             {
+                 if (replacement.cmd)
+diff --git a/include/wine/vulkan_driver.h b/include/wine/vulkan_driver.h
+index 9f786b7c995..9f217698299 100644
+--- a/include/wine/vulkan_driver.h
++++ b/include/wine/vulkan_driver.h
+@@ -159,6 +159,7 @@ struct vulkan_instance
+ {
+     VULKAN_OBJECT_HEADER( VkInstance, instance );
+     struct vulkan_instance_extensions extensions;
++    uint32_t api_version;
+ #define USE_VK_FUNC(x) PFN_ ## x p_ ## x;
+     ALL_VK_INSTANCE_FUNCS
+ #undef USE_VK_FUNC
+@@ -227,6 +228,8 @@ struct vulkan_device
+     VkQueueFamilyProperties *queue_props;
+     BOOL full_screen_exclusive_enabled;
+     BOOL low_latency_enabled;
++    BOOL dldsr_enabled;
++    unsigned int dldsr_sm;
+ };
+ 
+ static inline void vulkan_queue_lock( struct vulkan_queue *queue )
 diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
 index 3c8b0ff38de..70cec47664e 100644
 --- a/dlls/winewayland.drv/wayland_pointer.c
