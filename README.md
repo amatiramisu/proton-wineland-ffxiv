@@ -1,20 +1,14 @@
 # Proton Wineland FFXIV
 
-A Proton build for FFXIV through XIVLauncher, based on [Proton Salkim](https://github.com/nanomatters/proton-salkim). It adds DSR and DL-DSR supersampling under Wayland and Dalamud hook compatibility. [FFXIV DLSS Forge](https://github.com/amatiramisu/ffxiv-dlss-forge) is the companion add-on.
+Based on [Proton Salkim](https://github.com/nanomatters/proton-salkim).
+A custom build to add (DL)-DSR capabilities. Currently only for the FFXIV DLSS Forge. [FFXIV DLSS Forge](https://github.com/amatiramisu/ffxiv-dlss-forge)
+It might be usable for other games, the changes made here were only and specifically made for the Forge.
+If someone knows what they're doing, they probably could do some interesting things with this though.
+Just don't cheat on your wife with this.
 
 ## Install
 
-Release builds target x86-64-v3 CPUs (AVX2). Extract the archive into `~/.local/share/Steam/compatibilitytools.d/`, then select the build in XIVLauncher.
-
-## Changes
-
-- Desktop modes above the native resolution, reduced through a linear-light Gaussian filter or native NVIDIA DL-DSR.
-- Per-window filter and smoothness controls, with physical display queries and active-filter status for Forge.
-- Borderless windows stay fullscreen during a DSR mode change.
-- Executables load at a dynamic base, leaving room for Dalamud hooks. From GE-Proton.
-- The primary monitor follows KDE Plasma and GNOME, also without Steam running.
-
-The Wine patches are in `patches/wine/`.
+Release builds target x86-64-v3 CPUs (AVX2). Extract the archive into `~/.local/share/Steam/compatibilitytools.d/`, then select the build in XIVLauncher-RB.
 
 ## Build
 
