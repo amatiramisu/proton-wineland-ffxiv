@@ -2065,6 +2065,21 @@ $(DIST_COPY_TARGETS): | $(DST_DIR)
 
 all-dist: $(DIST_COPY_TARGETS)
 
+# Package local DL-DSR assets when present. Source builds can omit them.
+DLDSR_ASSETS ?= $(wildcard $(SRC)/dldsr-assets/621.14)
+DLDSR_DIST_DIR := $(DST_DIR)/share/dldsr/621.14
+
+.PHONY: dldsr-assets
+dldsr-assets: | $(DST_DIR)
+	rm -rf $(DLDSR_DIST_DIR)
+ifneq ($(strip $(DLDSR_ASSETS)),)
+	test -d "$(DLDSR_ASSETS)"
+	mkdir -p $(DLDSR_DIST_DIR)
+	cp -a "$(DLDSR_ASSETS)/." $(DLDSR_DIST_DIR)/
+endif
+
+all-dist: dldsr-assets
+
 all-dist:
 	echo `date '+%s'` `GIT_DIR=$(abspath $(SRCDIR)/.git) git describe --tags` > $(DIST_VERSION)
 

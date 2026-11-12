@@ -1,0 +1,411 @@
+{
+  "architectures": {
+    "75": {
+      "bytes": 126848,
+      "compatible_sm": [
+        75
+      ],
+      "elf_flags": 4916555,
+      "parameter_base": 352,
+      "programs": [
+        {
+          "changed_instruction_pcs": [],
+          "code_bytes": 35328,
+          "code_sha256": "71cdede9f04e3b445210fefba57945e51cab0e53b284ceb500080de21bc9c31c",
+          "elf_shared_bytes": 28576,
+          "exit_pcs": [
+            34160,
+            34704,
+            34736,
+            35232
+          ],
+          "nvuc_shared_bytes": 28576,
+          "record_bytes": 35524,
+          "record_offset": 0,
+          "record_sha256": "bf9437060c8ba6ca4205ba641ee7e19e88aed23a1a264ce16cf3cc5c15af6319",
+          "registers": 64,
+          "sampler_patch_pcs": [],
+          "vulkan_code_sha256": "71cdede9f04e3b445210fefba57945e51cab0e53b284ceb500080de21bc9c31c",
+          "vulkan_cubin_sha256": "cc472be1d72224fa49181b17d4ed958da5e310daff4634432436835cbc480d71"
+        },
+        {
+          "changed_instruction_pcs": [],
+          "code_bytes": 48128,
+          "code_sha256": "7d5638bfb5251d78bceea7d34bd41cefd6749657d874da2bb23548e86afa0b7f",
+          "elf_shared_bytes": 32256,
+          "exit_pcs": [
+            47024,
+            47536,
+            47568,
+            48016
+          ],
+          "nvuc_shared_bytes": 32256,
+          "record_bytes": 48324,
+          "record_offset": 35524,
+          "record_sha256": "e8e66d5725b5f35fd62ce180e5fabbd96b357c99c3cd58f4e0ca0eb8cffa8dd8",
+          "registers": 92,
+          "sampler_patch_pcs": [],
+          "vulkan_code_sha256": "7d5638bfb5251d78bceea7d34bd41cefd6749657d874da2bb23548e86afa0b7f",
+          "vulkan_cubin_sha256": "429d2c0f20f3eab24dea83407cfcd366919b6c1d16e955c8f0304ada3d997590"
+        }
+      ],
+      "sha256": "71c1cab5f6b87b06572f0901f9e438b22512ccb7645473d6a2795eb7f84c7e8d",
+      "size_va": 5386887912,
+      "source_handle_mode": "packed32-image-low20-sampler-high12",
+      "use64bit_texturing": false,
+      "va": 5386887920
+    },
+    "86": {
+      "bytes": 118144,
+      "compatible_sm": [
+        86,
+        89
+      ],
+      "elf_flags": 5637462,
+      "parameter_base": 352,
+      "programs": [
+        {
+          "changed_instruction_pcs": [],
+          "code_bytes": 32512,
+          "code_sha256": "0d81239e2e84553f11c775ff8e7551aaf7aaf5e85381c47fb5854e928ce117c4",
+          "elf_shared_bytes": 28576,
+          "exit_pcs": [
+            31184,
+            31728,
+            31760,
+            32256
+          ],
+          "nvuc_shared_bytes": 28576,
+          "record_bytes": 32708,
+          "record_offset": 0,
+          "record_sha256": "ea80c40b691978b4ff800453e43f87dd6b470edbb42d00e9ba9ecf37b5be742c",
+          "registers": 67,
+          "sampler_patch_pcs": [],
+          "vulkan_code_sha256": "0d81239e2e84553f11c775ff8e7551aaf7aaf5e85381c47fb5854e928ce117c4",
+          "vulkan_cubin_sha256": "5b8588ba21b09bd8fc36ac35091f674754c307d355a579eda3a52b795b586a22"
+        },
+        {
+          "changed_instruction_pcs": [],
+          "code_bytes": 43136,
+          "code_sha256": "5b2293dac640597be17a06b6a7f7ada04b98a859bf9bed6d611ca9140f80d99b",
+          "elf_shared_bytes": 32256,
+          "exit_pcs": [
+            41920,
+            42416,
+            42448,
+            42896
+          ],
+          "nvuc_shared_bytes": 32256,
+          "record_bytes": 43332,
+          "record_offset": 32708,
+          "record_sha256": "353cd1eb1302e9830d1abc9e4d6db4320a80f45f7e49607110430002969f1d29",
+          "registers": 95,
+          "sampler_patch_pcs": [],
+          "vulkan_code_sha256": "5b2293dac640597be17a06b6a7f7ada04b98a859bf9bed6d611ca9140f80d99b",
+          "vulkan_cubin_sha256": "e5f14f7cf7b2b1428d3a7e0b69184e950319c56f297e81de03ad3a2df52fc433"
+        }
+      ],
+      "sha256": "ea2f7084536026ed3c85888d17ebf91c61a1c10e6267c007e33cffab48f696d0",
+      "size_va": 5386887916,
+      "source_handle_mode": "packed32-image-low20-sampler-high12",
+      "use64bit_texturing": false,
+      "va": 5387014768
+    },
+    "120": {
+      "bytes": 161020,
+      "compatible_sm": [
+        120
+      ],
+      "elf_flags": 7865720,
+      "parameter_base": 896,
+      "programs": [
+        {
+          "changed_instruction_pcs": [
+            592,
+            608,
+            5920,
+            5936,
+            42720,
+            42736,
+            43600,
+            43616,
+            46064,
+            46080,
+            47024,
+            47040
+          ],
+          "code_bytes": 48512,
+          "code_sha256": "0ffdec5791cea9efea8b3bec8b19fbd0d56f1f6f23d7f82316165678919d510d",
+          "elf_shared_bytes": 30624,
+          "exit_pcs": [
+            41936,
+            43216,
+            45248,
+            45280,
+            46496,
+            48272
+          ],
+          "nvuc_shared_bytes": 29600,
+          "record_bytes": 48708,
+          "record_offset": 0,
+          "record_sha256": "d8f410c914ba2395894466b7941c36fc2079f6a6c7ccf1ccc5812697892ff074",
+          "registers": 72,
+          "sampler_patch_pcs": [
+            592,
+            5920,
+            42720,
+            43600,
+            46064,
+            47024
+          ],
+          "vulkan_code_sha256": "f84c52f7169317832d88e66c7ec91157d6405e0c4fe732158df3bbd8ee18493e",
+          "vulkan_cubin_sha256": "c90eb9c51d2c28481d2e5a142bf68e87bd764b5c4ecf52c42067956527ab2fa1"
+        },
+        {
+          "changed_instruction_pcs": [
+            592,
+            608,
+            5968,
+            5984,
+            52896,
+            52912,
+            53504,
+            53520,
+            56048,
+            56064,
+            56608,
+            56624
+          ],
+          "code_bytes": 58496,
+          "code_sha256": "bcde31a483e950937fbaa556a35e29dbf84e0297f263a3af2ee0596dd58f48bf",
+          "elf_shared_bytes": 34304,
+          "exit_pcs": [
+            53424,
+            55424,
+            56528,
+            58240
+          ],
+          "nvuc_shared_bytes": 33280,
+          "record_bytes": 58692,
+          "record_offset": 48708,
+          "record_sha256": "94b6bcd52c68c6696cbdd1f7f889a679e74acc12fa2c9392252e06b6541f67bf",
+          "registers": 94,
+          "sampler_patch_pcs": [
+            592,
+            5968,
+            52896,
+            53504,
+            56048,
+            56608
+          ],
+          "vulkan_code_sha256": "748017555fbcfd8d629b1c84e32336acbff0e0ac34cbc6f07a2e05866420803a",
+          "vulkan_cubin_sha256": "c1d320ae7c0e503a5acfe70d4c34fc073d9fed0e080c199cb7e1825a6cc0560d"
+        }
+      ],
+      "sha256": "e172b7cb1a2a4eaa6a7e08ed0a330e3612b81d6acba2f7b4276e5954a99dcebf",
+      "size_va": 5387293932,
+      "source_handle_mode": "handle64-low32-image-high32-sampler",
+      "use64bit_texturing": true,
+      "va": 5387132912
+    },
+    "121": {
+      "bytes": 160636,
+      "compatible_sm": [
+        121
+      ],
+      "elf_flags": 7931257,
+      "parameter_base": 896,
+      "programs": [
+        {
+          "changed_instruction_pcs": [
+            592,
+            608,
+            5920,
+            5936,
+            42976,
+            42992,
+            43856,
+            43872,
+            46352,
+            46368,
+            47312,
+            47328
+          ],
+          "code_bytes": 48768,
+          "code_sha256": "257df6b536015ba3b9be645c97b5266fdfc307081e7e436bc9ebf7311576bcdd",
+          "elf_shared_bytes": 30624,
+          "exit_pcs": [
+            42160,
+            43472,
+            45504,
+            45536,
+            46784,
+            48560
+          ],
+          "nvuc_shared_bytes": 29600,
+          "record_bytes": 48964,
+          "record_offset": 0,
+          "record_sha256": "cad07ea9bef94eb459b07beb73de450c645dedc9ee4b22790a58042d7ae8b774",
+          "registers": 72,
+          "sampler_patch_pcs": [
+            592,
+            5920,
+            42976,
+            43856,
+            46352,
+            47312
+          ],
+          "vulkan_code_sha256": "fa041db1e18cb6b6c29a99ccfd62bc8231b2a4379246fbaaf719665f47d4574c",
+          "vulkan_cubin_sha256": "b2746a04ca2e61f15002b2cedda752bbba2621de5d2e9b2ec770a4b4438a78e2"
+        },
+        {
+          "changed_instruction_pcs": [
+            576,
+            592,
+            5952,
+            5968,
+            53232,
+            53248,
+            53888,
+            53904,
+            56432,
+            56448,
+            57168,
+            57184
+          ],
+          "code_bytes": 58752,
+          "code_sha256": "d070c78609de9871a9a8660135f96dd3b73a8f75c8308a93208f6b851b40a72f",
+          "elf_shared_bytes": 34304,
+          "exit_pcs": [
+            53696,
+            55696,
+            56848,
+            58576
+          ],
+          "nvuc_shared_bytes": 33280,
+          "record_bytes": 58948,
+          "record_offset": 48964,
+          "record_sha256": "ac6148f381a8a596339000239beddd7a2d5b5398a27719763eac687dfc7a0b2e",
+          "registers": 94,
+          "sampler_patch_pcs": [
+            576,
+            5952,
+            53232,
+            53888,
+            56432,
+            57168
+          ],
+          "vulkan_code_sha256": "efbe4ff0e353d8d7fc592d6ba2c5902d15de1793aa85eb3e53f57a8034962eb8",
+          "vulkan_cubin_sha256": "e552b55ee1148765b9b492d40a8cd0996a5cfd070e8ea21f61ebea2a7342e771"
+        }
+      ],
+      "sha256": "65be609e94a8e2056c64f486afefe266c11ca19a035ed1887bb90907bdb798e3",
+      "size_va": 5387454572,
+      "source_handle_mode": "handle64-low32-image-high32-sampler",
+      "use64bit_texturing": true,
+      "va": 5387293936
+    }
+  },
+  "driver_sha256": "447c10f368d19db5f9dae9cceb690918d761f0d361d98017b7a68a54d99c6ba5",
+  "parameters": [
+    {
+      "bytes": 4,
+      "name": "destination_surface_handle32",
+      "offset": 0,
+      "type": "uint32"
+    },
+    {
+      "bytes": 4,
+      "name": "source_handle_word",
+      "offset": 4,
+      "type": "uint32"
+    },
+    {
+      "bytes": 4,
+      "name": "reciprocal_source_width",
+      "offset": 8,
+      "type": "float32"
+    },
+    {
+      "bytes": 4,
+      "name": "reciprocal_source_height",
+      "offset": 12,
+      "type": "float32"
+    },
+    {
+      "bytes": 4,
+      "name": "sharpening_coefficient",
+      "offset": 16,
+      "type": "float32"
+    },
+    {
+      "bytes": 4,
+      "name": "format_0x29_flag",
+      "offset": 20,
+      "type": "uint32"
+    },
+    {
+      "bytes": 8,
+      "name": "weights_device_address",
+      "offset": 24,
+      "type": "uint64"
+    },
+    {
+      "bytes": 4,
+      "name": "sampler_index_SM12x_only",
+      "offset": 32,
+      "type": "uint32"
+    },
+    {
+      "bytes": 4,
+      "name": "zero_padding",
+      "offset": 36,
+      "type": "uint32"
+    }
+  ],
+  "selection_ranges": [
+    {
+      "bytes": 32,
+      "label": "program selection table",
+      "sha256": "35145e9d86fa51e63b54ea1f89e7f4eab2040a46a7ba91a273f9bcdcf3f9917e",
+      "va": 5387454576
+    },
+    {
+      "bytes": 161,
+      "label": "architecture selector table",
+      "sha256": "ed33cb0d4b47fc95315ff5b20020e751914351953170bddcc032d0b6f1d41673",
+      "va": 5369529412
+    },
+    {
+      "bytes": 24,
+      "label": "architecture jump targets",
+      "sha256": "6dce3dc9acaed427e08d73b65a95fe7c885fe98c5886295ea4760c41585de721",
+      "va": 5369529388
+    },
+    {
+      "bytes": 201,
+      "label": "container dispatch",
+      "sha256": "c775a41f8b74ceaa9952c095f5ec36155c4e587f75211f21b5ed394904e5b5ef",
+      "va": 5369528336
+    },
+    {
+      "bytes": 48,
+      "label": "factor dispatch",
+      "sha256": "29fdc33dd00ca40eee5391f9570f625ab503dd8a05bba96be795a3ff7d6a6e28",
+      "va": 5369534421
+    }
+  ],
+  "version": 1,
+  "weights": [
+    {
+      "bytes": 10784,
+      "sha256": "0c5fb1aff3cd111f39ee4e88eb1074dadf2f05fe5e781f6a503ded55ab627904",
+      "va": 5386797008
+    },
+    {
+      "bytes": 20032,
+      "sha256": "c986769466c50d3efd2f47e0761ffc174d0302f44f280ada4f708afa8c35dca6",
+      "va": 5386807792
+    }
+  ]
+}

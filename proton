@@ -1346,11 +1346,11 @@ class CompatData:
                     try_copy(g_proton.lib_dir + "wine/discord-rpc-bridge/bridge.exe", "drive_c/windows/system32/discord/bridge.exe",
                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
 
-                # Try to detect known DLLs that ship with the NVIDIA Linux Driver
-                # and add them into the prefix
+                # Try to detect known DLLs and executables that ship with
+                # the NVIDIA Linux Driver and add them into the prefix
                 if g_session.nvidia_wine_dll_dir:
-                    for dll in ["_nvngx.dll", "nvngx.dll"]:
-                        try_copy(g_session.nvidia_wine_dll_dir + "/" + dll,
+                    for f in ["_nvngx.dll", "nvngx.dll", "nvngx_update.exe"]:
+                        try_copy(g_session.nvidia_wine_dll_dir + "/" + f,
                                  "drive_c/windows/system32",
                                  optional=True,
                                  prefix=self.prefix_dir,
@@ -1940,6 +1940,10 @@ class Session:
                 log("%s" % sys.exc_info()[1])
                 log("************************************************")
 
+        dldsr_dir = g_proton.dist_dir + "share/dldsr/621.14"
+        if "WINE_DLDSR_PATH" not in self.env and os.path.isdir(dldsr_dir):
+            self.env["WINE_DLDSR_PATH"] = dldsr_dir
+
         if "PROTON_LOG" in self.env and nonzero(self.env["PROTON_LOG"]):
             self.env.setdefault("WINEDEBUG", "+timestamp,+pid,+tid,+seh,+unwind,+threadname,+debugstr,+loaddll,+mscoree")
             self.env.setdefault("DXVK_LOG_LEVEL", "info")
@@ -2204,6 +2208,7 @@ class Session:
                     "939960", #Far Cry New Dawn
                     "250900", #The Binding of Isaac: Rebirth
                     "297860", #Split/Second
+                    "331600", #ONE PIECE PIRATE WARRIORS 3
                     ]:
                 self.env["PROTON_SPOOF_STEAMINPUT_VIDPID"] = "1"
 
