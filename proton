@@ -38,6 +38,11 @@ from ctypes import c_ssize_t
 from filelock import FileLock
 from random import randrange
 
+from proton_config import Settings
+
+g_user_config = Settings(os.environ, lambda message: print("Proton: " + message, file=sys.stderr))
+g_user_config.apply(os.environ)
+
 # Select the private driver before any module loads Vulkan.
 if os.environ.get("PROTON_RADV") == "1":
     import mesa
@@ -52,6 +57,7 @@ import vulkan_layers
 #To enable debug logging, copy "user_settings.sample.py" to "user_settings.py"
 #and edit it if needed.
 import utilities
+import upscalers
 
 
 CURRENT_PREFIX_VERSION="CachyOS-11.0-100"
@@ -1671,6 +1677,7 @@ class Session:
         if os.environ.get("PROTON_NATIVE_STEAM", "0") == "1":
             self.dlloverrides.pop("steam.exe", None)
             self.env["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
+            self.env["PROTON_WAYLAND_STEAM_OVERLAY"] = "0"
 
         #turn forcelgadd on by default unless it is disabled in compat config
         if "noforcelgadd" not in self.compat_config:
@@ -2036,8 +2043,7 @@ class Session:
         self.check_environment("PROTON_PREFER_SDL", "sdlinput")
         self.check_environment("PROTON_USE_SDL", "sdlinput")
         self.check_environment("PROTON_USE_PIPEWIRE", "pipewire")
-        self.check_environment("PROTON_FSR4_INDICATOR", "fsr4hud")
-        self.check_environment("PROTON_DLSS_INDICATOR", "dlsshud")
+        self.check_environment("PROTON_UPSCALER_INFO", "upscalerinfo")
         self.check_environment("PROTON_NATIVE_AGS", "nativeags")
 
         if "noesync" in self.compat_config:
@@ -2439,11 +2445,9 @@ class Session:
         if update_prefix_files:
             g_compatdata.setup_prefix()
 
-        if "fsr4hud" in self.compat_config:
+        if "upscalerinfo" in self.compat_config:
             self.env["FSR_WATERMARK"] = "1"
             self.env["FSR_FG_WATERMARK"] = "1"
-
-        if "dlsshud" in self.compat_config:
             self.env["DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS"] = "DLSSIndicator=1024,DLSSGIndicator=2,"
         else:
             self.env.setdefault("DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS", "DLSSIndicator=0,DLSSGIndicator=0,")
@@ -2601,14 +2605,12 @@ if __name__ == "__main__":
     protonfixes.setup_frame_rate(g_session.env, append_to_env_str)
     g_session.check_environment("PROTON_LOCAL_SHADER_CACHE", "localshadercache")
     protonfixes.setup_local_shader_cache(g_session.compat_config, g_session.env)
-    g_session.check_environment("PROTON_FFX3_UPGRADE", "ffx3")
-    g_session.check_environment("PROTON_FFX4_UPGRADE", "ffx4")
-    g_session.check_environment("PROTON_FSR4_UPGRADE", "fsr4")
     g_session.check_environment("PROTON_MLFG_UPGRADE", "mlfg")
-    g_session.check_environment("PROTON_DLSS_UPGRADE", "dlss")
-    g_session.check_environment("PROTON_XESS_UPGRADE", "xess")
     g_session.check_environment("PROTON_USE_OPTISCALER", "optiscaler")
     protonfixes.setup_upscalers(g_session.compat_config, g_session.env, g_compatdata.base_dir, g_compatdata.prefix_dir)
+    upscalers.setup(g_session.env,
+                    mode=sys.argv[1], command=sys.argv[2:], log=log,
+                    gpu_query=utilities.get_vulkan_gpus)
     protonfixes.execute()
 
     #determine mode

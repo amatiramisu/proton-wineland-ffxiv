@@ -885,6 +885,39 @@ $(eval $(call rules-source,piper,$(SRCDIR)/piper))
 $(eval $(call rules-cmake,piper,x86_64,unix))
 $(eval $(call rules-cmake,piper,aarch64,unix))
 
+ONNXRUNTIME_VER := 1.14.1
+ONNXRUNTIME_NUPKG := microsoft.ml.onnxruntime.$(ONNXRUNTIME_VER).nupkg
+ONNXRUNTIME_NUPKG_URL := https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$(ONNXRUNTIME_VER)/$(ONNXRUNTIME_NUPKG)
+ONNXRUNTIME_NUPKG_SHA256 := 3a277421efce94b5f91f4a5dc8efc1add99b4c01f547279d81098ffb4fafbb6d
+ONNXRUNTIME_x86_64_RID := linux-x64
+ONNXRUNTIME_aarch64_RID := linux-arm64
+
+PIPER_x86_64_CMAKE_ARGS = -DONNXRUNTIME_DIR=$(OBJ)/onnxruntime-x86_64
+PIPER_aarch64_CMAKE_ARGS = -DONNXRUNTIME_DIR=$(OBJ)/onnxruntime-aarch64
+
+$(SRC)/contrib/$(ONNXRUNTIME_NUPKG):
+	mkdir -p $(dir $@)
+	wget --no-use-server-timestamps -O $@.tmp $(ONNXRUNTIME_NUPKG_URL) || (rm -f $@.tmp; false)
+	echo "$(ONNXRUNTIME_NUPKG_SHA256)  $@.tmp" | sha256sum -c - || (rm -f $@.tmp; false)
+	mv $@.tmp $@
+
+$(OBJ)/.onnxruntime-%-unpack: $(SRC)/contrib/$(ONNXRUNTIME_NUPKG)
+	rm -rf $(OBJ)/onnxruntime-$*
+	mkdir -p $(OBJ)/onnxruntime-$*/include $(OBJ)/onnxruntime-$*/lib
+	unzip -j $< 'build/native/include/*.h' -d $(OBJ)/onnxruntime-$*/include
+	sed -i 's/\r$$//' $(OBJ)/onnxruntime-$*/include/*.h
+	unzip -j $< runtimes/$(ONNXRUNTIME_$*_RID)/native/libonnxruntime.so -d $(OBJ)/onnxruntime-$*/lib
+	mv $(OBJ)/onnxruntime-$*/lib/libonnxruntime.so $(OBJ)/onnxruntime-$*/lib/libonnxruntime.so.$(ONNXRUNTIME_VER)
+	ln -s libonnxruntime.so.$(ONNXRUNTIME_VER) $(OBJ)/onnxruntime-$*/lib/libonnxruntime.so
+	touch $@
+
+$(OBJ)/.piper-x86_64-configure: $(OBJ)/.onnxruntime-x86_64-unpack
+$(OBJ)/.piper-aarch64-configure: $(OBJ)/.onnxruntime-aarch64-unpack
+
+$(OBJ)/.piper-post-source: patches-source
+	$(foreach p,$(sort $(wildcard $(SRC)/patches/piper/*.patch)),patch -d $(PIPER_SRC) -Np1 -i $(PATCHES_SRC)/piper/$(notdir $(p)) &&) true
+	touch $@
+
 $(OBJ)/.piper-x86_64-post-build:
 	mkdir -p $(PIPER_x86_64_DST)/lib/$(x86_64-unix_TARGET)
 	mv $(PIPER_x86_64_DST)/*.so* $(PIPER_x86_64_DST)/lib/$(x86_64-unix_TARGET)
@@ -1980,6 +2013,8 @@ all-dist: $(DIST_LICENSE) $(DIST_OFL_LICENSE) $(DIST_AV1_PATENTS)
 ## protonfixes
 ##
 
+export ZENITY_RS_PATCH := $(PATCHES_SRC)/zenity-rs/0001-inline-progress-cancel.patch
+
 $(eval $(call rules-source,protonfixes,$(SRCDIR)/protonfixes))
 $(eval $(call rules-common,protonfixes,x86_64,unix))
 $(eval $(call rules-common,protonfixes,aarch64,unix))
@@ -2048,7 +2083,23 @@ $(PROTON37_TRACKED_FILES_TARGET): $(addprefix $(SRCDIR)/,proton_3.7_tracked_file
 USER_SETTINGS_PY_TARGET := $(addprefix $(DST_BASE)/,user_settings.sample.py)
 $(USER_SETTINGS_PY_TARGET): $(addprefix $(SRCDIR)/,user_settings.sample.py)
 
-DIST_COPY_TARGETS := $(FILELOCK_TARGET) $(PROTON_PY_TARGET) \
+PROTON_CONFIG_TARGET := $(addprefix $(DST_BASE)/,proton_config.py)
+$(PROTON_CONFIG_TARGET): $(addprefix $(SRCDIR)/,proton_config.py)
+
+PROTON_CONFIG_SAMPLE_TARGET := $(addprefix $(DST_BASE)/,config.sample.ini)
+$(PROTON_CONFIG_SAMPLE_TARGET): $(addprefix $(SRCDIR)/,config.sample.ini)
+
+UPSCALERS_TARGET := $(DST_BASE)/upscalers/.stamp
+$(UPSCALERS_TARGET): $(wildcard $(SRCDIR)/upscalers/*.py) $(wildcard $(SRCDIR)/upscalers/releases/*.json) \
+                     $(SRCDIR)/upscalers $(SRCDIR)/upscalers/releases $(SRCDIR)/Makefile.in | $(DST_DIR)
+	mkdir -p $(DST_BASE)/upscalers
+	rsync --delete --delete-excluded -arx --include='/*.py' --include='/releases/' \
+	      --include='/releases/*.json' --exclude='*' $(SRCDIR)/upscalers/ $(DST_BASE)/upscalers/
+	touch $@
+
+all-dist: $(UPSCALERS_TARGET)
+
+DIST_COPY_TARGETS := $(FILELOCK_TARGET) $(PROTON_PY_TARGET) $(PROTON_CONFIG_TARGET) $(PROTON_CONFIG_SAMPLE_TARGET) \
                      $(VULKAN_BINDINGS_TARGET) $(UTILITIES_TARGET) $(DESKTOP_MONITOR_TARGET) $(VULKAN_LAYERS_TARGET) $(MESA_TARGET) \
                      $(PROTON37_TRACKED_FILES_TARGET) $(USER_SETTINGS_PY_TARGET)
 
